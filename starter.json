@@ -1,0 +1,20 @@
+{
+  "name": "Busy Diggers",
+  "genre": "kids",
+  "dim": "2D",
+  "mode": "Co-op",
+  "players": "1–4",
+  "hook": "Tap the dirt, tap the hole. Fill the road, then a parade!",
+  "how": "Your child taps a dirt pile and their digger drives over and scoops it by itself, then taps a hole to tip it in. Fill every hole together and a steamroller and a parade roll across; no reading needed, and nobody can lose.",
+  "controls": "Tap or drag with one finger; the mouse works too (arrow keys drive as well)",
+  "uses": [
+    ["Bots", "Buddy dump trucks help slowly and leave the last load to your child."],
+    ["Live sync", "You see each other's diggers, fingers and every scoop at once."],
+    ["Host-run rounds", "One player's browser keeps the site and the buddies; if it leaves, the next takes over."]
+  ],
+  "ideas": [
+    "Make them tractors on a farm, filling the barn with hay",
+    "Add a cement mixer to the parade",
+    "Count out loud every time a load goes in"
+  ]
+}

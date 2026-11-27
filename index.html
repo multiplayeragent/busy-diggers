@@ -1,0 +1,1296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Busy Diggers</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #a9d98a; -webkit-tap-highlight-color: transparent; }
+  body { font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: none; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+  #net { position: fixed; left: max(10px, env(safe-area-inset-left)); bottom: max(6px, env(safe-area-inset-bottom)); font-size: 11px; color: #2f4a26; opacity: .5; pointer-events: none; }
+  #mute { position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right)); width: 52px; height: 52px; padding: 0; border-radius: 50%;
+          border: 3px solid #ffffffdd; background: #ffffff99; font-size: 24px; line-height: 1; touch-action: none; cursor: pointer; }
+  .attract #net, .attract #mute { display: none; }
+</style>
+<script src="https://cdn.multiplayeragent.com/sdk/mp.global.js"></script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="net">Connecting…</div>
+<button id="mute" aria-label="Sound on or off">🔊</button>
+<script>
+/* ═══ BUSY DIGGERS · a Multiplayer Agent starter ═════════════════════════════════════
+ * A toy building site for little kids (2 to 5). Tap the dirt, tap the hole: your digger
+ * drives there, scoops and tips by itself. Fill every hole and a parade drives across.
+ * Co-op, 1–4 players; buddy dump trucks help slowly. No reading, no losing, no scores.
+ *
+ * WHERE THINGS ARE (search for the "── " headers):
+ *   CONFIG ........ every number worth tuning: speeds, buddies, loads per site, the party
+ *   THEMES ........ the sites as data: road, pond, bridge, snow (road shape, pile spots, parade)
+ *   CONNECTION .... MP_CONNECT, joining, the offline room, who is host
+ *   THE SITE ...... the road, holes, piles and cones, built from a site's seed (every screen agrees)
+ *   SITE (HOST) ... making sites, scoop/dump checks, the party timer, writing `site`
+ *   BUDDIES (HOST)  the dump trucks: pick a pile, scoop, pick a hole, tip, rest, cheer
+ *   MY DIGGER ..... driving to the finger, auto scoop and tip, wrong tries, sending intents
+ *   OTHERS ........ everyone else's diggers (and buddies on other screens), eased between snapshots
+ *   SOUND ......... soft WebAudio notes from one pentatonic scale, mute, spoken counting
+ *   EFFECTS ....... particles: dirt, sparkles, hearts, notes, confetti
+ *   DRAW .......... fitting the site to any screen, ground, road, holes, piles, vehicles, the party
+ *   INPUT ......... every finger by pointerId: the newest one leads, the others sparkle
+ *   MAIN LOOP ..... frame(), start()
+ *
+ * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
+ *   - Each player writes its OWN entity: `d` (one JSON field: position, heading, bucket full,
+ *     target, finger, site id, ts = when it was sent) about 11 times a second, `hb` (heartbeat) once a second, and
+ *     `c` (its colour + animal) once.
+ *   - The HOST is the lowest sessionId among live players (heartbeat seen in the last 3s),
+ *     worked out every frame. Only the host writes `site` {id, v, seed, th (theme), nd (loads
+ *     each hole needs), h (loads in each hole), pm/p (dirt each pile started with / has left),
+ *     cel (when the party started, 0 = still digging), ak (the last intent number it handled
+ *     per player)} and `bots` (the buddy trucks, 10 times a second). `v` only goes up.
+ *   - Scooping and tipping happen on your screen at once and send "scoop" {site, pile, n} or
+ *     "dump" {site, hole, n} to the host. It checks them (same site, the digger is near, dirt
+ *     left / room left), applies them and writes `site`. A refused one gets "nope" {to, n} back:
+ *     a refused dump puts the load back in your bucket. The host applies its own directly.
+ *   - Every hole full: the host sets `cel`; everyone plays the steamroller and the parade from
+ *     that moment; then the host writes the next site (id + 1) and every screen slides it in.
+ *   - A new host adopts `site` and `bots` as they are and carries on (same holes, same trucks).
+ *   - ?attract plays offline with buddies only (the preview video is recorded from it).
+ */
+
+// ── CONFIG ──────────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  speed: 280,            // my digger, site px per second (the site is 1600 × 1000)
+  turn: 4.6,             // how fast diggers turn, radians per second
+  bucketReach: 84,       // the bucket sits this far in front of a digger's middle
+  actMs: 550,            // a scoop or a tip takes this long
+  pileR: 95,             // dirt pile radius (taps count up to 1.4× this)
+  holeR: 88,             // hole radius
+  loads: [8, 9, 10, 9],  // loads a site needs, by site number (rises gently, comes back down)
+  spare: 3,              // extra loads of dirt on the piles
+  botSpeed: 135,         // buddy trucks are slow
+  botRest: [2000, 4000], // ms a buddy rests after each scoop or tip
+  botBusyWaitMs: 5000,   // a buddy waits this long before touching a pile or hole a person is at
+  lastLoadWaitMs: 20000, // the last load is left for a person, unless nobody touched the screen this long
+  buddies: [2, 2, 1, 1, 0], // buddies by number of people in the room (0, 1, 2, 3, 4+)
+  slack: 240,            // host: how far past the edge a digger may be from the pile/hole it used
+  rollMs: 2400,          // the steamroller
+  paradeMs: 4200,        // the parade
+  slideMs: 900,          // the next site sliding in
+  hintIdleMs: 6000,      // the hand shows again after this long without a touch
+  sendMs: 90,            // my digger to the room ~11 times a second
+  interpMs: 130,         // others are drawn this far behind their newest snapshot, so there's always one to glide to
+  volume: 0.22,          // master volume (never above 0.25)
+  speak: true,           // say short words (counting the full holes) when the browser can
+  attract: { speed: 330, botSpeed: 300, botRest: [120, 350], left: 3, rollMs: 1400, paradeMs: 3200 },
+};
+// Players: a colour, an animal driver and a horn note each. Buddies use their own colours.
+// No names: unlike other starters this game never reads or shows the saved "mpa-name" (it's for little kids).
+const PALETTE = [
+  { color: "#ef5d5d", animal: "fox", note: 392 },
+  { color: "#4b8ef0", animal: "bunny", note: 523.3 },
+  { color: "#43bf6c", animal: "frog", note: 329.6 },
+  { color: "#a26ae6", animal: "cat", note: 440 },
+  { color: "#f27db8", animal: "pig", note: 587.3 },
+  { color: "#2fb8b0", animal: "bear", note: 293.7 },
+];
+const BUDDY_COLORS = ["#f6a13a", "#f2cc3a"];
+
+// ── THEMES ──────────────────────────────────────────────────────────────────────────
+// Points are fractions of the site (0..1 along its long side, 0..1 along its short side).
+// road: the road's shape; holes: where along the road the holes sit; piles: spots for dirt piles.
+const THEMES = [
+  { name: "road", ground: "#f3d79f", speck: "#e2bf7d", outside: "#a9d98a", road: [[-0.04, 0.52], [0.28, 0.46], [0.55, 0.56], [0.8, 0.5], [1.04, 0.54]],
+    holes: [0.14, 0.86], piles: [[0.14, 0.17], [0.46, 0.17], [0.8, 0.2], [0.18, 0.84], [0.5, 0.86], [0.85, 0.82]], deco: "trees", parade: ["bus", "icecream", "fire"] },
+  { name: "pond", ground: "#bfe293", speck: "#a9d27a", outside: "#9fd283", road: [[-0.04, 0.34], [0.3, 0.38], [0.62, 0.33], [1.04, 0.37]],
+    holes: [0.16, 0.84], piles: [[0.12, 0.14], [0.5, 0.13], [0.87, 0.14], [0.13, 0.8], [0.87, 0.8]], deco: "pond", parade: ["ducks", "bus", "icecream"] },
+  { name: "bridge", ground: "#cde69c", speck: "#b6d683", outside: "#a9d98a", road: [[-0.04, 0.5], [0.38, 0.56], [0.66, 0.48], [1.04, 0.5]],
+    holes: [0.1, 0.64], piles: [[0.1, 0.16], [0.38, 0.16], [0.64, 0.18], [0.12, 0.84], [0.4, 0.86], [0.64, 0.84]], deco: "river", parade: ["fire", "bus", "icecream"] },
+  { name: "snow", ground: "#eef4fb", speck: "#dbe6f2", outside: "#dde9f4", road: [[-0.04, 0.28], [0.35, 0.42], [0.65, 0.6], [1.04, 0.74]],
+    holes: [0.15, 0.85], piles: [[0.45, 0.14], [0.8, 0.2], [0.15, 0.72], [0.5, 0.86], [0.88, 0.17]], deco: "snow", parade: ["bus", "fire", "icecream"] },
+];
+
+// ── CONNECTION ──────────────────────────────────────────────────────────────────────
+// The builder fills these in for this game. Downloaded from GitHub? Put your own pk_ key here.
+const MP_CONNECT = {
+  key: 'pk_REPLACE_ME',
+  room: 'busy-diggers',
+  endpoint: 'wss://live.multiplayeragent.com',
+  apiUrl: 'https://api.multiplayeragent.com',
+};
+const ATTRACT = new URLSearchParams(location.search).has("attract");
+if (ATTRACT) {
+  const A = CONFIG.attract;
+  Object.assign(CONFIG, { speed: A.speed, botSpeed: A.botSpeed, botRest: A.botRest, rollMs: A.rollMs, paradeMs: A.paradeMs, buddies: [2, 2, 2, 2, 2] });
+  document.documentElement.classList.add("attract");
+}
+
+/** Same shape as the SDK client, kept in this tab: offline play and ?attract. */
+function localRoom() {
+  const id = "local", state = { entities: { players: { [id]: {} } }, shared: {} }, subs = [];
+  let queued = false;
+  const emit = () => { if (!queued) { queued = true; queueMicrotask(() => { queued = false; subs.forEach((f) => f(state)); }); } };
+  const put = (o, k, v) => { if (typeof k === "object") Object.assign(o, k); else o[k] = v; emit(); };
+  return {
+    sessionId: id, state, offline: true,
+    me: { set: (k, v) => put(state.entities.players[id], k, v) },
+    setShared: (k, v) => put(state.shared, k, v),
+    onState: (f) => { subs.push(f); f(state); }, onJoin() {}, onLeave() {}, on() {}, send() {},
+    onDisconnect() {}, onReconnect() {}, leave: async () => {},
+  };
+}
+
+async function connect() {
+  if (ATTRACT || typeof MP === "undefined") return localRoom();
+  try {
+    const join = MP.join({ ...MP_CONNECT });
+    const mp = await Promise.race([join, new Promise((_, no) => setTimeout(() => no(new Error("timed out")), 10000))]);
+    window.mp = mp; // the builder calls window.mp.leave() when the page closes
+    return mp;
+  } catch (e) {
+    console.warn("Playing offline:", e && e.message);
+    return localRoom();
+  }
+}
+
+const parse = (v, fallback) => { if (typeof v !== "string") return fallback; try { return JSON.parse(v); } catch { return fallback; } };
+const memo = new Map();
+/** A shared JSON field, parsed once per change (read-only: never mutate what this returns). */
+function shared(key, fallback, map = (v) => v) {
+  const raw = S.shared[key], m = memo.get(key);
+  if (m && m.raw === raw) return m.v;
+  const v = map(parse(raw, fallback));
+  memo.set(key, { raw, v });
+  return v;
+}
+const entityMemo = new Map();
+/** A player's `d` field, parsed once per change. */
+function parseOnce(id, raw) {
+  const m = entityMemo.get(id);
+  if (m && m.raw === raw) return m.v;
+  const v = parse(raw, null);
+  entityMemo.set(id, { raw, v });
+  return v;
+}
+let net = null;      // the room client (real or local)
+let S = { entities: { players: {} }, shared: {} }; // latest state
+const seenHb = new Map(); // sessionId -> { hb, at } on OUR clock
+
+/** Players whose heartbeat moved in the last 3s (plus us), sorted by sessionId. */
+function livePlayers() {
+  const now = performance.now(), out = [];
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    const s = seenHb.get(id);
+    if (!s || s.hb !== p.hb) seenHb.set(id, { hb: p.hb, at: now });
+    if (id === net.sessionId || now - seenHb.get(id).at < 3000) out.push(id);
+  }
+  if (!out.includes(net.sessionId)) out.push(net.sessionId);
+  return out.sort();
+}
+let frameAt = 0, wokeAt = -1e9; // my loop's last frame, and when it last woke from a stall (a frozen or background tab)
+/** Never while my own loop is stalled, nor for 0.7s after it wakes: the room moved on without me, so the newer state lands first. */
+const isHost = () => livePlayers()[0] === net.sessionId && performance.now() - frameAt < 1000 && performance.now() - wokeAt > 700;
+
+// ── THE SITE ────────────────────────────────────────────────────────────────────────
+// Site coordinates: x along the long side (0..SW), y along the short side (0..SH). Every
+// screen draws the same site; a portrait screen just turns it on its side (see DRAW).
+const SW = 1600, SH = 1000, EDGE = 72;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const angDiff = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
+const rnd = (a, b) => a + Math.random() * (b - a);
+/** A seeded random generator: the same seed gives every client the same numbers. */
+function mulberry32(a) {
+  return function () { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+/** The theme's road points, smoothed (Catmull-Rom) and measured. */
+function roadPath(points) {
+  const P = points.map(([a, b]) => ({ x: a * SW, y: b * SH })), out = [];
+  for (let i = 0; i < P.length - 1; i++) {
+    const p0 = P[Math.max(0, i - 1)], p1 = P[i], p2 = P[i + 1], p3 = P[Math.min(P.length - 1, i + 2)];
+    for (let k = 0; k < 16; k++) {
+      const t = k / 16, t2 = t * t, t3 = t2 * t;
+      const f = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+      out.push({ x: f(p0.x, p1.x, p2.x, p3.x), y: f(p0.y, p1.y, p2.y, p3.y) });
+    }
+  }
+  out.push({ ...P[P.length - 1] });
+  let len = 0; out[0].l = 0;
+  for (let i = 1; i < out.length; i++) { len += dist(out[i].x, out[i].y, out[i - 1].x, out[i - 1].y); out[i].l = len; }
+  return { pts: out, len };
+}
+/** The point and direction at fraction t of the road (beyond 0..1 it carries on straight). */
+function alongRoad(road, t) {
+  const p = road.pts, L = clamp(t, 0, 1) * road.len;
+  let i = 1; while (i < p.length - 1 && p[i].l < L) i++;
+  const a = p[i - 1], b = p[i], k = (L - a.l) / Math.max(1e-6, b.l - a.l), ang = Math.atan2(b.y - a.y, b.x - a.x);
+  const extra = (t < 0 ? t : t > 1 ? t - 1 : 0) * road.len;
+  return { x: a.x + (b.x - a.x) * k + Math.cos(ang) * extra, y: a.y + (b.y - a.y) * k + Math.sin(ang) * extra, a: ang };
+}
+const roadDist = (road, x, y) => road.pts.reduce((m, p) => Math.min(m, dist(p.x, p.y, x, y)), 1e9);
+
+const layouts = new Map();
+/** Where everything is on a site, from its theme and seed (cones and wobbles are this screen's own). */
+function layoutOf(site) {
+  const key = `${site.th}:${site.seed}:${site.nd.length}:${site.pm.length}`;
+  if (layouts.has(key)) return layouts.get(key);
+  const T = THEMES[site.th % THEMES.length], rng = mulberry32(site.seed ^ 0x51ed), road = roadPath(T.road);
+  const n = site.nd.length, [t0, t1] = T.holes;
+  const holes = site.nd.map((_, i) => {
+    const t = n === 1 ? (t0 + t1) / 2 : t0 + ((t1 - t0) * i) / (n - 1) + (rng() - 0.5) * 0.03, p = alongRoad(road, t);
+    const nx = -Math.sin(p.a), ny = Math.cos(p.a), off = CONFIG.holeR + 34;
+    return { x: p.x, y: p.y, t, r: CONFIG.holeR, wob: 0, cones: [{ x: p.x + nx * off, y: p.y + ny * off, wob: 0 }, { x: p.x - nx * off, y: p.y - ny * off, wob: 0 }] };
+  });
+  const spots = T.piles.slice();
+  for (let i = spots.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [spots[i], spots[j]] = [spots[j], spots[i]]; }
+  const piles = site.pm.map((_, i) => ({ x: spots[i % spots.length][0] * SW + (rng() - 0.5) * 50, y: spots[i % spots.length][1] * SH + (rng() - 0.5) * 36, r: CONFIG.pileR, wob: 0 }));
+  const deco = [];
+  for (let k = 0; k < 60 && deco.length < 9; k++) {
+    const x = 70 + rng() * (SW - 140), y = 70 + rng() * (SH - 140), kind = rng() < 0.45 ? "tree" : rng() < 0.7 ? "flower" : "rock";
+    if (roadDist(road, x, y) < 150 || [...piles, ...holes].some((o) => dist(o.x, o.y, x, y) < o.r + 90) || deco.some((d) => dist(d.x, d.y, x, y) < 120)) continue;
+    if (T.deco === "pond" && Math.hypot((x - 0.5 * SW) / 400, (y - 0.73 * SH) / 210) < 1) continue;
+    if (T.deco === "river" && x > 0.76 * SW && x < 0.94 * SW) continue;
+    deco.push({ x, y, kind, s: 0.8 + rng() * 0.4 });
+  }
+  const specks = []; for (let k = 0; k < 70; k++) specks.push({ x: rng() * SW, y: rng() * SH, r: 4 + rng() * 9 });
+  const L = { T, road, holes, piles, deco, specks };
+  layouts.set(key, L);
+  return L;
+}
+const validSite = (s) => s && typeof s === "object" && Number.isFinite(s.id) && Array.isArray(s.nd) && Array.isArray(s.h) && Array.isArray(s.p) && Array.isArray(s.pm) && s.nd.length === s.h.length && s.p.length === s.pm.length ? s : null;
+const remaining = (s) => s.nd.reduce((n, need, i) => n + Math.max(0, need - s.h[i]), 0);
+const partyMs = () => CONFIG.rollMs + CONFIG.paradeMs;
+
+// ── SITE (HOST) ─────────────────────────────────────────────────────────────────────
+const world = { site: null, bots: new Map(), wasHost: false, dirty: false, lastWrite: 0, lastBots: 0, celAt: 0, humanAt: 0, lastSpawn: 0 };
+
+/** A new site: theme by number, holes and loads from a fresh seed. */
+function makeSite(id, v) {
+  const seed = (Math.random() * 2 ** 31) | 0, rng = mulberry32(seed), th = (id - 1) % THEMES.length;
+  const total = CONFIG.loads[(id - 1) % CONFIG.loads.length];
+  const counts = [3, 4, 5].filter((n) => n <= total && n * 3 >= total);
+  const n = counts[Math.floor(rng() * counts.length)] || 3;
+  const nd = new Array(n).fill(1);
+  for (let left = total - n, guard = 0; left > 0 && guard < 99; guard++) { const i = Math.floor(rng() * n); if (nd[i] < 3) { nd[i]++; left--; } }
+  const h = nd.map(() => 0);
+  if (ATTRACT) { // the preview starts close to the end, so 8 seconds show digging AND the party
+    for (let i = 0; i < n && remaining({ nd, h }) > CONFIG.attract.left; i++) h[i] = Math.min(nd[i] - 1, h[i] + remaining({ nd, h }) - CONFIG.attract.left);
+    for (let i = 0; i < n && remaining({ nd, h }) > CONFIG.attract.left; i++) h[i] = Math.min(nd[i], h[i] + remaining({ nd, h }) - CONFIG.attract.left);
+  }
+  const m = rng() < 0.5 ? 2 : 3, supply = (ATTRACT ? remaining({ nd, h }) : total) + CONFIG.spare, pm = [];
+  for (let i = 0; i < m; i++) pm.push(Math.floor(supply / m) + (i < supply % m ? 1 : 0));
+  return { id, v, seed, th, nd, h, pm, p: pm.slice(), cel: 0, ak: {} };
+}
+
+/** Become host: take over the site and the buddies exactly as state has them. */
+function adoptWorld() {
+  const s = validSite(parse(S.shared.site, null)), now = performance.now();
+  world.site = s ? { ...s, nd: s.nd.slice(), h: s.h.slice(), p: s.p.slice(), pm: s.pm.slice(), ak: { ...(s.ak || {}) }, cel: +s.cel || 0 } : makeSite(1, 1);
+  world.celAt = world.site.cel ? now - clamp(Date.now() - world.site.cel, 0, partyMs()) : 0;
+  world.bots.clear();
+  for (const b of parse(S.shared.bots, [])) {
+    if (b && typeof b.x === "number" && typeof b.y === "number") world.bots.set(b.i, { id: b.i, x: b.x, y: b.y, a: +b.a || 0, spd: 0, full: !!b.f, c: b.c | 0, st: "rest", until: now + 600, goal: null, cheerUntil: 0, act: 0, actKind: "", wob: 0, waitFrom: 0 });
+  }
+  world.humanAt = now;
+  world.dirty = !s;
+}
+
+function applyScoop(i) {
+  const s = world.site;
+  if (s.cel || !(s.p[i] > 0)) return false;
+  s.p[i]--; world.dirty = true;
+  return true;
+}
+function applyDump(i) {
+  const s = world.site;
+  if (s.cel || !(s.h[i] < s.nd[i])) return false;
+  s.h[i]++; world.dirty = true;
+  if (remaining(s) === 0) { s.cel = Date.now(); world.celAt = performance.now(); }
+  return true;
+}
+
+/** A "scoop" or "dump" intent from another player: same site, digger near, dirt or room left. */
+function hostIntent(kind, from, m) {
+  const s = world.site;
+  if (!s || !m || typeof m.n !== "number") return;
+  s.ak[from] = Math.max(s.ak[from] || 0, m.n); world.dirty = true;
+  if (m.site !== s.id || s.cel) return; // a stale intent for an earlier site, or the party has started: ignore
+  const Lo = layoutOf(s), i = kind === "scoop" ? m.pile : m.hole, o = (kind === "scoop" ? Lo.piles : Lo.holes)[i];
+  if (!o) return;
+  const d = parseOnce(from, S.entities.players?.[from]?.d);
+  const near = d && typeof d.x === "number" && dist(d.x, d.y, o.x, o.y) < o.r + CONFIG.slack;
+  const ok = near && (kind === "scoop" ? applyScoop(i) : applyDump(i));
+  if (!ok) net.send("nope", { to: from, n: m.n, k: kind, site: s.id });
+  else { world.humanAt = performance.now(); if (kind === "dump") cheer(); }
+}
+
+function writeSite(now) {
+  const sh = validSite(shared("site", null));
+  if (sh && (sh.v > world.site.v || sh.id > world.site.id)) { world.wasHost = false; return; } // someone wrote newer: adopt it next tick
+  world.site.v = Math.max(world.site.v, sh ? sh.v : 0) + 1;
+  world.lastWrite = now; world.dirty = false;
+  net.setShared("site", JSON.stringify(world.site));
+}
+
+function hostTick(dt, now) {
+  if (!world.wasHost) { adoptWorld(); world.wasHost = true; }
+  const s = world.site;
+  const humans = livePlayers().length, want = CONFIG.buddies[Math.min(humans, CONFIG.buddies.length - 1)];
+  if (world.bots.size < want && now - world.lastSpawn > 700) { spawnBot(); world.lastSpawn = now; }
+  if (world.bots.size > want) world.bots.delete([...world.bots.keys()].sort().pop());
+  for (const b of world.bots.values()) botTick(b, dt, now);
+  if (!s.cel && s.p.every((x) => x <= 0) && remaining(s) > 0) { // out of dirt: a pile pops back up
+    const i = s.pm.indexOf(Math.max(...s.pm)); s.p[i] = remaining(s) + 1; s.pm[i] = Math.max(s.pm[i], s.p[i]); world.dirty = true;
+  }
+  if (s.cel && now - world.celAt > partyMs() + 250) { // the party is over: the next site
+    world.site = makeSite(s.id + 1, s.v + 1); world.celAt = 0; world.dirty = true;
+    for (const b of world.bots.values()) Object.assign(b, { full: false, st: "rest", until: now + 1200, goal: null });
+  }
+  if (world.dirty && now - world.lastWrite > 120) writeSite(now);
+  if (now - world.lastBots > 100) {
+    world.lastBots = now;
+    net.setShared("bots", JSON.stringify([...world.bots.values()].map((b) => ({ i: b.id, x: Math.round(b.x), y: Math.round(b.y), a: Math.round(b.a * 100) / 100, f: b.full ? 1 : 0,
+      k: b.act > 0 ? (b.actKind === "scoop" ? 1 : 2) : 0, h: now < b.cheerUntil ? 1 : 0, c: b.c, ts: Date.now() % 1e9 }))));
+  }
+}
+
+// ── BUDDIES (HOST) ──────────────────────────────────────────────────────────────────
+function spawnBot() {
+  const used = new Set([...world.bots.values()].map((b) => b.c)), c = [0, 1].find((k) => !used.has(k)) ?? 0;
+  const id = "b" + (c + 1), Lo = world.site && layoutOf(world.site), p = Lo ? alongRoad(Lo.road, 0.94 - c * 0.05) : { x: SW - 120, y: SH / 2, a: 0 };
+  world.bots.set(id, { id, x: clamp(p.x, EDGE, SW - EDGE), y: clamp(p.y + 40, EDGE, SH - EDGE), a: Math.PI, spd: 0, full: false, c, st: "rest", until: performance.now() + 800,
+    goal: null, cheerUntil: 0, act: 0, actKind: "", wob: 0, waitFrom: 0 });
+}
+
+/** Every person's digger as the host sees it (me included), for "is a person working there?". */
+function people() {
+  const out = [];
+  if (me.placed) out.push({ x: me.x, y: me.y, t: me.goal ? objOf(me.goal) : me.tx != null ? { x: me.tx, y: me.ty } : null, full: me.full });
+  for (const v of views.values()) if (!v.bot) out.push({ x: v.x, y: v.y, t: Array.isArray(v.goal) ? { x: v.goal[0], y: v.goal[1] } : null, full: v.full });
+  return out;
+}
+const objOf = (g) => { const Lo = lk && lk.Lo; return Lo ? (g.k === "pile" ? Lo.piles : Lo.holes)[g.i] : null; };
+
+/** What a buddy should do next: the nearest pile (bucket empty) or hole (full) that a person is not at. */
+function botGoal(b, now) {
+  const s = world.site, Lo = layoutOf(s), folks = people();
+  const busy = (o) => folks.some((p) => dist(p.x, p.y, o.x, o.y) < o.r + 140 || (p.t && dist(p.t.x, p.t.y, o.x, o.y) < o.r + 30));
+  const patient = b.waitFrom && now - b.waitFrom > CONFIG.botBusyWaitMs;
+  const engaged = !ATTRACT && now - world.humanAt < CONFIG.lastLoadWaitMs;
+  const others = [...world.bots.values()].filter((o) => o !== b);
+  // loads already on their way; a person's only counts while they're playing (a child who wandered off holding one doesn't stall the site)
+  const carried = others.filter((o) => o.full).length + (engaged ? folks.filter((p) => p.full).length : 0) + (b.full ? 1 : 0);
+  const left = remaining(s) - carried; // loads nobody is carrying yet
+  let best = null, bd = 1e9;
+  if (!b.full) {
+    if (left <= 0 || (left <= 1 && engaged)) return null; // leave the last load for a person
+    Lo.piles.forEach((o, i) => {
+      if (!(s.p[i] > 0) || (!patient && busy(o))) return;
+      const d = dist(b.x, b.y, o.x, o.y) + (others.some((q) => q.goal && q.goal.k === "pile" && q.goal.i === i) ? 300 : 0);
+      if (d < bd) { bd = d; best = { k: "pile", i }; }
+    });
+  } else {
+    if (left + 1 <= 1 && engaged && folks.length) return null; // mine would be the last load: wait for a person
+    Lo.holes.forEach((o, i) => {
+      const reserved = others.filter((q) => q.full && q.goal && q.goal.k === "hole" && q.goal.i === i).length;
+      if (s.h[i] + reserved >= s.nd[i] || (!patient && busy(o))) return;
+      const d = dist(b.x, b.y, o.x, o.y) + reserved * 250; // spread out: not all on one hole
+      if (d < bd) { bd = d; best = { k: "hole", i }; }
+    });
+  }
+  if (!best) { b.waitFrom = b.waitFrom || now; return null; }
+  b.waitFrom = 0;
+  return best;
+}
+
+function botTick(b, dt, now) {
+  const s = world.site, Lo = layoutOf(s);
+  b.act = Math.max(0, b.act - dt); b.wob = Math.max(0, b.wob - dt * 1.6);
+  if (s.cel) { b.spd *= Math.pow(0.05, dt); if (now > b.cheerUntil && Math.random() < dt * 0.9) b.cheerUntil = now + 900; return; } // party: stop and cheer
+  if (b.st === "rest") { b.spd *= Math.pow(0.02, dt); moveBy(b, dt); if (now > b.until) b.st = "think"; return; }
+  if (b.st === "think") {
+    b.goal = botGoal(b, now);
+    if (b.goal) b.st = "go"; else { b.st = "rest"; b.until = now + 900; }
+    return;
+  }
+  const o = b.goal.k === "pile" ? Lo.piles[b.goal.i] : Lo.holes[b.goal.i];
+  if (b.st === "go") {
+    const stillOk = b.goal.k === "pile" ? !b.full && s.p[b.goal.i] > 0 : b.full && s.h[b.goal.i] < s.nd[b.goal.i];
+    if (!stillOk) { b.st = "think"; return; }
+    drive(b, o.x, o.y, CONFIG.botSpeed, dt, CONFIG.turn * 0.7);
+    if (dist(b.x, b.y, o.x, o.y) < o.r * 0.5) {
+      const ok = b.goal.k === "pile" ? applyScoop(b.goal.i) : applyDump(b.goal.i);
+      if (ok) { b.full = b.goal.k === "pile"; b.act = (CONFIG.actMs * 1.6) / 1000; b.actKind = b.goal.k === "pile" ? "scoop" : "dump"; b.st = "act"; }
+      else b.st = "think";
+    }
+    return;
+  }
+  if (b.st === "act") { b.spd *= Math.pow(0.01, dt); moveBy(b, dt); if (b.act <= 0) { b.st = "rest"; b.until = now + rnd(CONFIG.botRest[0], CONFIG.botRest[1]); } }
+}
+
+/** A person tipped a load: the buddies hop and send hearts. */
+function cheer() { const now = performance.now(); for (const b of world.bots.values()) b.cheerUntil = now + 1100; }
+
+// ── MY DIGGER ───────────────────────────────────────────────────────────────────────
+const me = { x: 200, y: 500, a: 0, spd: 0, full: false, tx: null, ty: null, goal: null, act: 0, actKind: "", wob: 0, ops: 0, pend: [], wrong: 0, help: false,
+  lastSend: 0, lastRaw: "", c: 0, placed: false, inputs: 0, actedAt: -1e9, honkAt: -1e9 };
+let lk = null; // this frame's look at the site: { s, Lo, p, h } (my unconfirmed scoops/tips on top)
+
+/** Turn toward (tx, ty) and roll on until the point `stopAt` ahead of the middle (the bucket) is on it.
+ *  Slows for sharp turns and brakes on arrival, so nothing overshoots or circles; too close, it just turns. */
+function drive(v, tx, ty, speed, dt, turn = CONFIG.turn, stopAt = 0) {
+  const d = dist(tx, ty, v.x, v.y), left = d - stopAt; // how far to go before the stop point is over the target
+  if (d < 5 || (stopAt === 0 && left < 8)) { v.spd *= Math.pow(0.01, dt); moveBy(v, dt); return; }
+  const diff = angDiff(Math.atan2(ty - v.y, tx - v.x), v.a);
+  v.a = angDiff(v.a + clamp(diff, -turn * dt, turn * dt), 0);
+  const want = left > 6 ? speed * clamp(Math.cos(diff), 0.18, 1) * Math.min(1, left / 90) : 0;
+  v.spd += (want - v.spd) * Math.min(1, dt * 6);
+  v.spd = Math.min(v.spd, Math.max(0, left) * 5); // brake: never roll past it
+  moveBy(v, dt);
+}
+function moveBy(v, dt) {
+  v.x = clamp(v.x + Math.cos(v.a) * v.spd * dt, EDGE, SW - EDGE);
+  v.y = clamp(v.y + Math.sin(v.a) * v.spd * dt, EDGE, SH - EDGE);
+}
+const bucketOf = (v, reach) => ({ x: v.x + Math.cos(v.a) * reach, y: v.y + Math.sin(v.a) * reach });
+
+/** The site as this screen shows it: the host's truth, plus my scoops and tips it hasn't confirmed yet. */
+function truthSite() { return isHost() ? world.site : shared("site", null, validSite); }
+function look() {
+  const s = truthSite();
+  if (!s) return null;
+  const mine = isHost() ? [] : me.pend.filter((q) => q.site === s.id), count = (k, i) => mine.filter((q) => q.k === k && q.i === i).length;
+  return { s, Lo: layoutOf(s), p: s.p.map((v, i) => Math.max(0, v - count("scoop", i))), h: s.h.map((v, i) => Math.min(s.nd[i], v + count("dump", i))) };
+}
+
+/** Where my bucket should go next: the nearest hole with room (full) or pile with dirt (empty). */
+function nextTarget() {
+  if (!lk || lk.s.cel) return null;
+  let best = null, bd = 1e9;
+  const list = me.full ? lk.Lo.holes : lk.Lo.piles;
+  list.forEach((o, i) => {
+    const ok = me.full ? lk.h[i] < lk.s.nd[i] : lk.p[i] > 0, d = dist(me.x, me.y, o.x, o.y);
+    if (ok && d < bd) { bd = d; best = { k: me.full ? "hole" : "pile", i, o }; }
+  });
+  return best;
+}
+
+/** Start near the beginning of the road, on a spot no other vehicle is on. */
+function placeMe() {
+  const others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([id, p]) => parseOnce(id, p.d)).filter((d) => d && typeof d.x === "number");
+  others.push(...shared("bots", []).filter((b) => b && typeof b.x === "number"));
+  let spot = null;
+  for (let k = 0; k < 8 && !spot; k++) {
+    const p = alongRoad(lk.Lo.road, 0.05 + Math.floor(k / 2) * 0.07), q = { x: clamp(p.x, EDGE + 20, SW - EDGE), y: clamp(p.y + (k % 2 ? 60 : -60), EDGE, SH - EDGE) };
+    if (!others.some((o) => dist(o.x, o.y, q.x, q.y) < 120)) spot = q;
+  }
+  spot = spot || { x: 200 + Math.random() * 300, y: 300 + Math.random() * 400 };
+  Object.assign(me, { x: spot.x, y: spot.y, a: 0, placed: true });
+}
+
+function scoop(i, now) {
+  const s = lk.s;
+  me.full = true; me.act = CONFIG.actMs / 1000; me.actKind = "scoop"; me.actedAt = now; me.wrong = 0; me.help = false;
+  if (isHost()) { if (!applyScoop(i)) me.full = false; else world.humanAt = now; }
+  else { const n = ++me.ops; me.pend.push({ k: "scoop", i, n, at: now, site: s.id }); publish(true); net.send("scoop", { site: s.id, pile: i, n }); }
+}
+function dump(i, now) {
+  const s = lk.s;
+  me.full = false; me.act = CONFIG.actMs / 1000; me.actKind = "dump"; me.actedAt = now; me.wrong = 0; me.help = false;
+  if (isHost()) { if (!applyDump(i)) me.full = true; else { world.humanAt = now; cheer(); } }
+  else { const n = ++me.ops; me.pend.push({ k: "dump", i, n, at: now, site: s.id }); publish(true); net.send("dump", { site: s.id, hole: i, n }); }
+}
+/** A try that can't work here (empty bucket at a hole, a full hole...): a soft wobble and a boop. */
+function wrongTry(o) {
+  me.wob = 1; if (o) o.wob = 1;
+  me.wrong++; if (me.wrong >= 2) me.help = true; // after two, the right place bounces
+  sfx.boop();
+}
+/** The host said no (someone else filled that hole first): settle it softly. */
+function onNope(m) {
+  if (!m || m.to !== net.sessionId) return;
+  me.pend = me.pend.filter((q) => q.n !== m.n);
+  if (!lk || m.site !== lk.s.id) return;
+  me.full = m.k === "dump"; // a refused tip: the load is still in my bucket; a refused scoop: it never was
+}
+
+function myTick(dt, now) {
+  if (!lk) return;
+  if (!me.placed) placeMe();
+  if (ATTRACT) autopilot(now);
+  if (keys.size) { // arrow keys: the target runs ahead of the digger
+    const kx = (keys.has("ArrowRight") ? 1 : 0) - (keys.has("ArrowLeft") ? 1 : 0), ky = (keys.has("ArrowDown") ? 1 : 0) - (keys.has("ArrowUp") ? 1 : 0);
+    if (kx || ky) { const [lx, ly] = VIEW.land ? [kx, ky] : [ky, kx], k = 150 / Math.hypot(lx, ly); me.goal = null; me.tx = clamp(me.x + lx * k, EDGE, SW - EDGE); me.ty = clamp(me.y + ly * k, EDGE, SH - EDGE); }
+  }
+  const g = me.goal && objOf(me.goal), slow = me.act > 0 ? 0.35 : 1;
+  if (g) drive(me, g.x, g.y, CONFIG.speed * slow, dt, CONFIG.turn, CONFIG.bucketReach); // a pile or hole: stop with the bucket on it
+  else if (me.tx != null) drive(me, me.tx, me.ty, CONFIG.speed * slow, dt);
+  else { me.spd *= Math.pow(0.05, dt); moveBy(me, dt); }
+  me.act = Math.max(0, me.act - dt); me.wob = Math.max(0, me.wob - dt * 1.6);
+  if (lk.s.cel || me.act > 0) return;
+  const bk = bucketOf(me, CONFIG.bucketReach);
+  let acted = null; // { k, i } of what I just scooped from or tipped into
+  if (!me.full) lk.Lo.piles.forEach((o, i) => { if (!acted && lk.p[i] > 0 && dist(bk.x, bk.y, o.x, o.y) < o.r * 0.8) { scoop(i, now); acted = { k: "pile", i }; } });
+  else lk.Lo.holes.forEach((o, i) => { if (!acted && lk.h[i] < lk.s.nd[i] && dist(bk.x, bk.y, o.x, o.y) < o.r * 0.75) { dump(i, now); acted = { k: "hole", i }; } });
+  const atGoal = acted && me.goal && acted.k === me.goal.k && acted.i === me.goal.i;
+  if (atGoal) me.goal.done = true;
+  else if (me.goal && !me.goal.done && g && dist(bk.x, bk.y, g.x, g.y) < g.r * 0.7) { me.goal.done = true; wrongTry(g); } // arrived where I was sent, and it can't be done here
+}
+
+/** ?attract: my digger drives itself, straight to whatever needs doing next. */
+function autopilot(now) {
+  if (lk.s.cel) { if (!me.goal || me.goal.k !== "park") { const p = alongRoad(lk.Lo.road, 0.5); me.goal = null; me.tx = p.x; me.ty = clamp(p.y + 190, EDGE, SH - EDGE); } return; }
+  const t = nextTarget(), g = me.goal;
+  const stale = g && (g.k === "pile" ? !(lk.p[g.i] > 0) : !(lk.h[g.i] < lk.s.nd[g.i]));
+  if (t && (!g || g.done || g.k !== t.k || stale)) { me.goal = { k: t.k, i: t.i, done: false }; me.tx = t.o.x; me.ty = t.o.y; }
+}
+
+function publish(force) {
+  const now = performance.now();
+  if (!force && now - me.lastSend < CONFIG.sendMs) return;
+  const lead = leadId != null ? pointers.get(leadId) : null, g = me.goal && objOf(me.goal);
+  const t = g ? [Math.round(g.x), Math.round(g.y)] : me.tx != null ? [Math.round(me.tx), Math.round(me.ty)] : 0;
+  const d = { x: Math.round(me.x), y: Math.round(me.y), a: Math.round(me.a * 100) / 100, f: me.full ? 1 : 0, k: me.act > 0 ? (me.actKind === "scoop" ? 1 : 2) : 0,
+    t, p: lead ? [Math.round(lead.x), Math.round(lead.y)] : 0, i: me.inputs, s: lk ? lk.s.id : 0 };
+  const raw = JSON.stringify(d);
+  if (raw === me.lastRaw && !force && now - me.lastSend < 1000) return; // standing still: once a second is plenty
+  me.lastRaw = raw; me.lastSend = now;
+  d.ts = Date.now() % 1e9; // when I sent it, on my clock: others play my snapshots back at the pace I made them
+  net.me.set("d", JSON.stringify(d));
+}
+
+/** Two people joined at once with one colour: the one with the higher sessionId picks a free one. */
+function fixColor() {
+  const others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId && livePlayers().includes(id));
+  if (!others.some(([id, p]) => Number(p.c) === me.c && id < net.sessionId)) return;
+  const taken = new Set(others.map(([, p]) => Number(p.c))), free = PALETTE.findIndex((_, k) => !taken.has(k));
+  if (free >= 0) { me.c = free; net.me.set("c", free); }
+}
+
+// ── OTHERS ──────────────────────────────────────────────────────────────────────────
+// Each snapshot carries the sender's clock (ts). We keep the last few and draw each vehicle where it was
+// CONFIG.interpMs ago on ITS clock, between the two snapshots around that moment: smooth, whatever the network does.
+const views = new Map(); // id -> someone else's digger (or a buddy, on a screen that isn't the host's)
+/** Position and heading at sender time rt, from a buffer of {t, x, y, a} (headings turn the short way). */
+function sampleAt(buf, rt) {
+  if (rt <= buf[0].t) return buf[0];
+  for (let i = 1; i < buf.length; i++) {
+    const p = buf[i - 1], q = buf[i];
+    if (rt <= q.t) { const k = (rt - p.t) / Math.max(1, q.t - p.t); return { x: p.x + (q.x - p.x) * k, y: p.y + (q.y - p.y) * k, a: p.a + angDiff(q.a, p.a) * k }; }
+  }
+  const q = buf[buf.length - 1], p = buf[buf.length - 2]; // past the newest: carry on a little along its last motion
+  if (!p || q.t - p.t > 400) return q;
+  const k = Math.min(rt - q.t, 120) / Math.max(1, q.t - p.t);
+  return { x: q.x + (q.x - p.x) * k, y: q.y + (q.y - p.y) * k, a: q.a };
+}
+function syncViews(now, dt) {
+  const live = new Set(livePlayers()), seen = new Set(), host = isHost();
+  const add = (id, d, bot, c) => {
+    if (!d || typeof d.x !== "number" || typeof d.y !== "number") return;
+    seen.add(id);
+    let v = views.get(id);
+    const a = +d.a || 0;
+    if (!v) { v = { id, bot, x: d.x, y: d.y, a, buf: [], off: null, full: !!d.f, wob: 0, act: 0, k: 0, px: null, py: null, i: d.i }; views.set(id, v); }
+    const ts = typeof d.ts === "number" ? d.ts : now, newest = v.buf[v.buf.length - 1];
+    if (!newest || ts < newest.t - 5000) { v.buf = []; v.off = null; } // first snapshot, or their clock jumped
+    if (!v.buf.length || ts > v.buf[v.buf.length - 1].t) {
+      v.buf.push({ t: ts, x: d.x, y: d.y, a });
+      if (v.buf.length > 12) v.buf.shift();
+      const off = now - ts; // our clock minus theirs (plus the trip): follow the quickest trip, drift slowly
+      v.off = v.off == null || off < v.off ? off : v.off + (off - v.off) * 0.05;
+    }
+    if (d.k && !v.k) { v.act = (CONFIG.actMs * (bot ? 1.6 : 1)) / 1000; v.actKind = d.k === 1 ? "scoop" : "dump"; }
+    v.k = d.k; v.c = c; v.goal = d.t; v.cheer = !!d.h;
+    v.full = !!d.f;
+    if (Array.isArray(d.p)) { if (v.px == null) { v.px = d.p[0]; v.py = d.p[1]; } v.ptx = d.p[0]; v.pty = d.p[1]; } else v.px = null;
+    if (!bot && d.i !== v.i) { v.i = d.i; if (host) world.humanAt = now; } // they touched their screen
+  };
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    if (id !== net.sessionId && live.has(id)) add(id, parseOnce(id, p.d), false, clamp(Number(p.c) || 0, 0, PALETTE.length - 1));
+  }
+  if (!host) for (const b of shared("bots", [])) if (b) add(b.i, b, true, b.c | 0);
+  for (const id of views.keys()) if (!seen.has(id)) views.delete(id);
+  for (const v of views.values()) {
+    const p = sampleAt(v.buf, now - v.off - CONFIG.interpMs);
+    v.x = p.x; v.y = p.y; v.a = p.a;
+    v.act = Math.max(0, v.act - dt); v.wob = Math.max(0, v.wob - dt * 1.6);
+    if (v.px != null) { v.px += (v.ptx - v.px) * Math.min(1, dt * 12); v.py += (v.pty - v.py) * Math.min(1, dt * 12); }
+  }
+}
+
+/** Everything that drives, as this screen draws it: me, the others, and (on the host) its own buddies. */
+function vehicles() {
+  const out = [];
+  if (me.placed) out.push({ id: "me", kind: "digger", x: me.x, y: me.y, a: me.a, full: me.full, c: me.c, act: me.act, actKind: me.actKind, wob: me.wob, mine: true, ref: me, spd: me.spd });
+  for (const v of views.values()) out.push({ id: v.id, kind: v.bot ? "truck" : "digger", x: v.x, y: v.y, a: v.a, full: v.full, c: v.c, act: v.act, actKind: v.actKind, wob: v.wob, cheer: v.cheer, ref: v });
+  if (isHost()) for (const b of world.bots.values()) out.push({ id: b.id, kind: "truck", x: b.x, y: b.y, a: b.a, full: b.full, c: b.c, act: b.act, actKind: b.actKind, wob: b.wob, cheer: performance.now() < b.cheerUntil, ref: b });
+  return out;
+}
+
+// ── SOUND ───────────────────────────────────────────────────────────────────────────
+const AU = { ctx: null, master: null, muted: false };
+try { AU.muted = localStorage.getItem("mpa-mute") === "1"; } catch {}
+const PENTA = [261.6, 293.7, 329.6, 392, 440, 523.3, 587.3, 659.3, 784, 880, 1046.5]; // C major pentatonic: everything sounds nice together
+/** Create or wake the audio on the first touch (browsers only allow it then). */
+function audioOn() {
+  if (ATTRACT) return;
+  try {
+    if (!AU.ctx) {
+      const C = window.AudioContext || window.webkitAudioContext; if (!C) return;
+      AU.ctx = new C(); AU.master = AU.ctx.createGain(); AU.master.gain.value = AU.muted ? 0 : CONFIG.volume; AU.master.connect(AU.ctx.destination);
+    }
+    if (AU.ctx.state === "suspended") AU.ctx.resume();
+  } catch {}
+}
+/** One soft note: a short ramp in (no clicks) and a gentle fade out. */
+function tone(f, dur = 0.18, { type = "sine", vol = 0.5, at = 0, slide = 0 } = {}) {
+  const c = AU.ctx; if (!c || AU.muted) return;
+  const t = c.currentTime + at, o = c.createOscillator(), g = c.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t); if (slide) o.frequency.exponentialRampToValueAtTime(f * slide, t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(AU.master); o.start(t); o.stop(t + dur + 0.05);
+}
+const sfx = {
+  tick: () => tone(PENTA[8 + Math.floor(Math.random() * 3)], 0.09, { vol: 0.12 }),
+  putt: () => tone(86, 0.07, { type: "triangle", vol: 0.14 }),
+  scoop: (soft) => { const v = soft ? 0.18 : 0.38; tone(PENTA[7], 0.12, { vol: v }); tone(PENTA[5], 0.16, { vol: v, at: 0.08 }); },
+  dump: (soft) => { const v = soft ? 0.18 : 0.38; tone(PENTA[4], 0.22, { vol: v, slide: 0.6 }); tone(PENTA[2], 0.2, { vol: v, at: 0.12 }); },
+  full: () => [5, 7, 8, 10].forEach((k, i) => tone(PENTA[k], 0.25, { vol: 0.3, at: i * 0.09 })),
+  boop: () => tone(220, 0.28, { vol: 0.3, slide: 0.75 }),
+  beep: () => tone(PENTA[9], 0.1, { type: "triangle", vol: 0.16 }),
+  horn: (c, soft) => { const f = PALETTE[c % PALETTE.length].note, v = soft ? 0.18 : 0.34; tone(f, 0.15, { type: "triangle", vol: v }); tone(f, 0.22, { type: "triangle", vol: v, at: 0.19 }); },
+  rumble: () => tone(70, 0.16, { type: "triangle", vol: 0.16 }),
+  tune: () => [5, 7, 8, 7, 8, 9, 8, 10].forEach((k, i) => tone(PENTA[k], 0.2, { type: "triangle", vol: 0.26, at: i * 0.22 })),
+  honk: (k) => { tone(PENTA[3 + k], 0.14, { type: "triangle", vol: 0.26 }); tone(PENTA[5 + k], 0.2, { type: "triangle", vol: 0.26, at: 0.16 }); },
+};
+/** Say a short word, when the browser can (never needed to play). */
+function say(text) {
+  if (!CONFIG.speak || AU.muted || ATTRACT) return;
+  try { if (!("speechSynthesis" in window)) return; speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.rate = 0.9; u.pitch = 1.25; u.volume = 0.8; speechSynthesis.speak(u); } catch {}
+}
+const COUNT_WORDS = ["one", "two", "three", "four", "five"];
+const muteBtn = document.getElementById("mute");
+function showMute() { muteBtn.textContent = AU.muted ? "🔇" : "🔊"; }
+muteBtn.addEventListener("pointerdown", (e) => {
+  e.preventDefault(); e.stopPropagation();
+  AU.muted = !AU.muted; audioOn();
+  try { localStorage.setItem("mpa-mute", AU.muted ? "1" : "0"); } catch {}
+  try { if (AU.master) AU.master.gain.value = AU.muted ? 0 : CONFIG.volume; if (AU.muted && "speechSynthesis" in window) speechSynthesis.cancel(); } catch {}
+  showMute();
+});
+showMute();
+
+// ── EFFECTS ─────────────────────────────────────────────────────────────────────────
+const parts = []; // particles, in display coordinates (see DRAW)
+const CONFETTI = ["#ef5d5d", "#4b8ef0", "#43bf6c", "#f2cc3a", "#a26ae6", "#f27db8"];
+/** n particles of one kind at a site point {x, y} (or a display point with disp = true). */
+function burst(pt, n, kind, disp = false) {
+  const [x, y] = disp ? [pt.x, pt.y] : toDisp(pt.x, pt.y);
+  for (let k = 0; k < n; k++) {
+    const a = rnd(0, Math.PI * 2), sp = rnd(60, 220);
+    const p = { x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 120, g: 420, life: rnd(0.5, 0.9), max: 0.9, kind, r: rnd(6, 12), rot: rnd(0, 6), vr: rnd(-6, 6), col: "#9b6a3f" };
+    if (kind === "spark") Object.assign(p, { col: k % 2 ? "#fff6b0" : "#ffffff", g: 60, r: rnd(7, 13) });
+    if (kind === "heart") Object.assign(p, { vx: rnd(-40, 40), vy: rnd(-150, -90), g: -20, col: "#ff7aa8", r: rnd(10, 14), life: 1.1, max: 1.1 });
+    if (kind === "note") Object.assign(p, { vx: rnd(-50, 50), vy: rnd(-170, -110), g: 0, col: k % 2 ? "#4b8ef0" : "#a26ae6", r: 11, life: 1, max: 1 });
+    if (kind === "ring") Object.assign(p, { vx: 0, vy: 0, g: 0, r: 20, life: 0.5, max: 0.5, col: "#ffffff" });
+    if (kind === "dirt") p.col = Math.random() < 0.5 ? "#9b6a3f" : "#b98150";
+    parts.push(p);
+  }
+}
+function confetti(n) {
+  for (let k = 0; k < n; k++) parts.push({ x: rnd(0, VIEW.DW), y: rnd(-60, VIEW.DH * 0.2), vx: rnd(-50, 50), vy: rnd(90, 220), g: 30, life: rnd(1.6, 2.4), max: 2.4, kind: "confetti", r: rnd(8, 14), rot: rnd(0, 6), vr: rnd(-5, 5), col: CONFETTI[k % CONFETTI.length] });
+}
+function stepParts(dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += (p.vr || 0) * dt; p.life -= dt;
+    if (p.kind === "ring") p.r += 160 * dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  if (parts.length > 500) parts.splice(0, parts.length - 500);
+}
+
+/** Effects every screen plays from state: buckets filling/tipping, piles shrinking, holes filling. */
+const watch = { f: new Map(), p: [], h: [], site: null };
+function watchEffects(now) {
+  if (!lk) return;
+  const vs = vehicles();
+  if (watch.site !== lk.s.id) { // a new site: everything starts empty, no effects for that
+    watch.site = lk.s.id; watch.p = lk.p.slice(); watch.h = lk.h.slice();
+    for (const v of vs) watch.f.set(v.id, v.full);
+    return;
+  }
+  for (const v of vs) {
+    const was = watch.f.get(v.id); watch.f.set(v.id, v.full);
+    if (was === undefined || was === v.full) continue;
+    const reach = v.kind === "truck" ? -40 : CONFIG.bucketReach, pt = bucketOf(v, reach);
+    burst(pt, v.full ? 8 : 12, "dirt");
+    if (v.full) sfx.scoop(!v.mine); else sfx.dump(!v.mine);
+  }
+  lk.h.forEach((h, i) => {
+    const o = lk.Lo.holes[i];
+    if (h > (watch.h[i] ?? h)) {
+      burst(o, 6, "dirt"); o.wob = 0.6;
+      if (h >= lk.s.nd[i]) { burst(o, 14, "spark"); burst(o, 1, "ring"); sfx.full(); const full = lk.h.filter((x, j) => x >= lk.s.nd[j]).length; if (full < lk.h.length) say(COUNT_WORDS[full - 1] || ""); }
+    }
+  });
+  lk.p.forEach((p, i) => { if (p < (watch.p[i] ?? p)) lk.Lo.piles[i].wob = 0.6; });
+  watch.p = lk.p.slice(); watch.h = lk.h.slice();
+}
+
+/** Vehicles pass through each other: a friendly wobble and a beep. Cones wobble when bumped. */
+const overlapping = new Set();
+function bumps() {
+  if (!lk) return;
+  const vs = vehicles();
+  for (let i = 0; i < vs.length; i++) for (let j = i + 1; j < vs.length; j++) {
+    const a = vs[i], b = vs[j], key = a.id + "|" + b.id, near = dist(a.x, a.y, b.x, b.y) < 95;
+    if (near && !overlapping.has(key)) { overlapping.add(key); a.ref.wob = 1; b.ref.wob = 1; if (a.mine || b.mine) sfx.beep(); }
+    if (!near) overlapping.delete(key);
+  }
+  for (const h of lk.Lo.holes) for (const c of h.cones) {
+    if (c.wob < 0.3 && vs.some((v) => dist(v.x, v.y, c.x, c.y) < 70)) c.wob = 1;
+  }
+}
+
+// ── DRAW ────────────────────────────────────────────────────────────────────────────
+// The site is drawn in "display" coordinates: the same as site coordinates on a landscape
+// screen, swapped (x↔y) on a portrait one, so both show the whole site as big as it fits.
+const cv = document.getElementById("game"), ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+const VIEW = { land: true, s: 1, ox: 0, oy: 0, DW: SW, DH: SH };
+function fit() {
+  DPR = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  VIEW.land = W >= H; VIEW.DW = VIEW.land ? SW : SH; VIEW.DH = VIEW.land ? SH : SW;
+  VIEW.s = Math.min((W - 12) / VIEW.DW, (H - 12) / VIEW.DH);
+  VIEW.ox = (W - VIEW.DW * VIEW.s) / 2; VIEW.oy = (H - VIEW.DH * VIEW.s) / 2;
+}
+addEventListener("resize", fit); addEventListener("orientationchange", fit); fit();
+const toDisp = (x, y) => (VIEW.land ? [x, y] : [y, x]);
+const dispAng = (a) => (VIEW.land ? a : Math.atan2(Math.cos(a), Math.sin(a)));
+/** A finger on the screen → a point on the site, through the same fit the frame is drawn with. */
+function screenToSite(cx, cy) { const dx = (cx - VIEW.ox) / VIEW.s, dy = (cy - VIEW.oy) / VIEW.s; return VIEW.land ? [dx, dy] : [dy, dx]; }
+const OUT = "#4a3426"; // the thick toy outline
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function fillStroke(fill, lw = 6) { ctx.fillStyle = fill; ctx.fill(); ctx.lineWidth = lw; ctx.strokeStyle = OUT; ctx.stroke(); }
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, Math.max(0.1, r), 0, Math.PI * 2); }
+function shade(hex, k) { const n = parseInt(hex.slice(1), 16), f = (c) => Math.round(clamp(k < 0 ? c * (1 + k) : c + (255 - c) * k, 0, 255)); return `rgb(${f(n >> 16)},${f((n >> 8) & 255)},${f(n & 255)})`; }
+
+function draw(now, dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const T = lk ? lk.Lo.T : THEMES[0];
+  ctx.fillStyle = T.outside; ctx.fillRect(0, 0, W, H);
+  drawMeadow(T);
+  ctx.setTransform(DPR * VIEW.s, 0, 0, DPR * VIEW.s, DPR * VIEW.ox, DPR * VIEW.oy);
+  if (!lk) { rr(0, 0, VIEW.DW, VIEW.DH, 40); fillStroke(THEMES[0].ground, 10); return; }
+  const slide = clamp((now - seenSite.slideAt) / CONFIG.slideMs, 0, 1), ease = slide * slide * (3 - 2 * slide);
+  if (slide < 1 && seenSite.prev) {
+    drawSite(seenSite.prev.s, seenSite.prev.Lo, seenSite.prev.s.p, seenSite.prev.s.h, -ease * VIEW.DW * 1.05, now, 1e9);
+    drawSite(lk.s, lk.Lo, lk.p, lk.h, (1 - ease) * VIEW.DW * 1.05, now, -1);
+  } else drawSite(lk.s, lk.Lo, lk.p, lk.h, 0, now, partyAge(now));
+  const vs = vehicles().map((v) => ({ ...v, dy: toDisp(v.x, v.y)[1] })).sort((a, b) => a.dy - b.dy);
+  const fingers = fingerPoints();
+  for (const v of vs) drawVehicle(v, now, fingers);
+  if (slide >= 1) drawParty(now, lk);
+  drawArrow(now);
+  for (const v of views.values()) if (!v.bot && v.px != null) drawFinger(v.px, v.py, v.c, now);
+  drawParts();
+  drawHint(now);
+}
+
+/** Grass tufts, flowers and bushes around the board (screen space), so a tall or wide screen isn't empty. */
+function drawMeadow(T) {
+  const bx = VIEW.ox - 20, by = VIEW.oy - 20, bw = VIEW.DW * VIEW.s + 40, bh = VIEW.DH * VIEW.s + 40, snow = T.deco === "snow";
+  for (let k = 0; k < 160; k++) {
+    const x = (k * 173.3 + (k % 7) * 31) % W, y = (k * 97.7 + (k % 5) * 53) % H;
+    if (x > bx - 10 && x < bx + bw + 10 && y > by - 10 && y < by + bh + 10) continue;
+    if (k % 9 === 0) { circle(x, y, 16 + (k % 3) * 4); ctx.fillStyle = snow ? "#f7fbff" : "#7fc46a"; ctx.fill(); circle(x - 6, y - 6, 6); ctx.fillStyle = snow ? "#ffffff" : "#98d683"; ctx.fill(); }
+    else if (k % 4 === 0) { circle(x, y, 4); ctx.fillStyle = snow ? "#ffffff" : ["#ff8fb3", "#ffffff", "#ffd75a"][k % 3]; ctx.fill(); }
+    else { ctx.strokeStyle = snow ? "#c9d9ea" : "#8cc874"; ctx.lineWidth = 2.5; ctx.lineCap = "round"; ctx.beginPath(); for (const dx of [-4, 0, 4]) { ctx.moveTo(x + dx, y); ctx.lineTo(x + dx * 1.6, y - 8 - Math.abs(dx)); } ctx.stroke(); }
+  }
+}
+
+/** The ground, road, decorations, holes and piles of one site, shifted by offX (the slide). */
+function drawSite(s, Lo, p, h, offX, now, age) {
+  ctx.save(); ctx.translate(offX, 0);
+  const T = Lo.T;
+  rr(-14, -14, VIEW.DW + 28, VIEW.DH + 28, 46); fillStroke("#d89a55", 8); // the wooden board
+  rr(6, 6, VIEW.DW - 12, VIEW.DH - 12, 34); ctx.fillStyle = T.ground; ctx.fill();
+  ctx.fillStyle = T.speck; for (const k of Lo.specks) { const [x, y] = toDisp(k.x, k.y); circle(x, y, k.r); ctx.fill(); }
+  if (T.deco === "pond") drawPond(now);
+  if (T.deco === "river") drawRiver(now);
+  drawRoad(Lo, T);
+  if (T.deco === "river") drawBridge(Lo);
+  for (const d of Lo.deco) drawDeco(d, T);
+  const help = me.help && nextTarget();
+  Lo.holes.forEach((o, i) => drawHole(o, h[i], s.nd[i], age >= 0 && rollerT(age) > o.t, now, help && help.k === "hole" && help.i === i, T));
+  Lo.piles.forEach((o, i) => drawPile(o, p[i], s.pm[i], now, T, help && help.k === "pile" && help.i === i));
+  if (T.deco === "pond" && (age < 0 || age < CONFIG.rollMs)) drawDucks(Lo, now, -1);
+  if (T.deco === "snow") drawSnow(now);
+  ctx.restore();
+}
+
+function drawRoad(Lo, T) {
+  const path = () => { ctx.beginPath(); Lo.road.pts.forEach((q, i) => { const [x, y] = toDisp(q.x, q.y); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); }); };
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  ctx.save(); rr(6, 6, VIEW.DW - 12, VIEW.DH - 12, 34); ctx.clip();
+  path(); ctx.strokeStyle = T.deco === "pond" ? "#a7814f" : OUT; ctx.lineWidth = 168; ctx.stroke();
+  path(); ctx.strokeStyle = roadColor(T); ctx.lineWidth = 152; ctx.stroke();
+  if (T.deco !== "pond") { path(); ctx.setLineDash([42, 38]); ctx.strokeStyle = T.deco === "snow" ? "#ffffff" : "#ffd75a"; ctx.lineWidth = 10; ctx.stroke(); ctx.setLineDash([]); }
+  ctx.restore();
+}
+const roadColor = (T) => (T.deco === "pond" ? "#d7b47c" : T.deco === "snow" ? "#9aa6b5" : "#8f949c");
+function drawPond(now) {
+  const [x, y] = toDisp(0.5 * SW, 0.73 * SH), [rx, ry] = VIEW.land ? [330, 160] : [160, 330];
+  ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); fillStroke("#7cc6ee", 8);
+  ctx.beginPath(); ctx.ellipse(x, y, rx * 0.78, ry * 0.7, 0, 0, Math.PI * 2); ctx.fillStyle = "#93d3f3"; ctx.fill();
+  for (let k = 0; k < 4; k++) { const a = k * 1.7 + now / 3000, [lx, ly] = [x + Math.cos(a) * rx * 0.55, y + Math.sin(a) * ry * 0.5]; circle(lx, ly, 26); fillStroke("#6cc46a", 4); }
+}
+function drawRiver(now) {
+  ctx.save(); rr(6, 6, VIEW.DW - 12, VIEW.DH - 12, 34); ctx.clip();
+  const [x0, y0] = toDisp(0.78 * SW, 0), [x1, y1] = toDisp(0.92 * SW, SH);
+  ctx.beginPath(); ctx.rect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)); fillStroke("#7cc6ee", 8);
+  ctx.strokeStyle = "#b9e6fb"; ctx.lineWidth = 6;
+  for (let k = 0; k < 8; k++) { const f = ((k / 8 + now / 9000) % 1) * SH, w = 0.82 * SW + (k % 3) * 40, [a, b] = toDisp(w, f), [c, d] = toDisp(w + 40, f); ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(c, d); ctx.stroke(); }
+  ctx.restore();
+}
+function drawBridge(Lo) {
+  ctx.save();
+  const [x0, y0] = toDisp(0.775 * SW, 0), [x1, y1] = toDisp(0.925 * SW, SH);
+  ctx.beginPath(); ctx.rect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)); ctx.clip();
+  const path = () => { ctx.beginPath(); Lo.road.pts.forEach((q, i) => { const [x, y] = toDisp(q.x, q.y); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); }); };
+  path(); ctx.strokeStyle = OUT; ctx.lineWidth = 186; ctx.stroke();
+  path(); ctx.strokeStyle = "#c9864a"; ctx.lineWidth = 170; ctx.stroke();
+  path(); ctx.setLineDash([10, 24]); ctx.strokeStyle = "#8f5a2e"; ctx.lineWidth = 150; ctx.stroke(); ctx.setLineDash([]);
+  ctx.restore();
+}
+function drawSnow(now) {
+  ctx.fillStyle = "#ffffffcc";
+  for (let k = 0; k < 40; k++) { const x = ((k * 197.3) % VIEW.DW) + Math.sin(now / 900 + k) * 20, y = (k * 131.7 + now * 0.05 * (1 + (k % 3) * 0.3)) % VIEW.DH; circle(x, y, 5 + (k % 3) * 2); ctx.fill(); }
+}
+function drawDeco(d, T) {
+  const [x, y] = toDisp(d.x, d.y), s = d.s;
+  if (d.kind === "tree") {
+    ctx.beginPath(); ctx.ellipse(x, y + 10, 40 * s, 14 * s, 0, 0, Math.PI * 2); ctx.fillStyle = "#00000022"; ctx.fill();
+    rr(x - 9 * s, y - 30 * s, 18 * s, 40 * s, 6); fillStroke("#a8703f", 5);
+    if (T.deco === "snow") { ctx.beginPath(); ctx.moveTo(x, y - 110 * s); ctx.lineTo(x + 48 * s, y - 20 * s); ctx.lineTo(x - 48 * s, y - 20 * s); ctx.closePath(); fillStroke("#3f9a63", 5); ctx.beginPath(); ctx.moveTo(x, y - 110 * s); ctx.lineTo(x + 20 * s, y - 72 * s); ctx.lineTo(x - 20 * s, y - 72 * s); ctx.closePath(); ctx.fillStyle = "#fff"; ctx.fill(); }
+    else { circle(x, y - 58 * s, 44 * s); fillStroke("#5fbf5a", 5); circle(x - 14 * s, y - 72 * s, 14 * s); ctx.fillStyle = "#86d97c"; ctx.fill(); }
+  } else if (d.kind === "flower") {
+    const col = ["#ff8fb3", "#ffffff", "#ffd75a", "#b38cff"][Math.floor(d.s * 10) % 4];
+    for (let k = 0; k < 5; k++) { const a = (k / 5) * Math.PI * 2; circle(x + Math.cos(a) * 10, y + Math.sin(a) * 10, 8); ctx.fillStyle = T.deco === "snow" ? "#ffffff" : col; ctx.fill(); }
+    circle(x, y, 7); ctx.fillStyle = "#f6a13a"; ctx.fill();
+  } else { ctx.beginPath(); ctx.ellipse(x, y, 26 * s, 18 * s, 0, 0, Math.PI * 2); fillStroke(T.deco === "snow" ? "#e3ebf5" : "#b9b2a6", 5); }
+}
+
+function drawHole(o, fill, need, paved, now, glow, T) {
+  const [x, y] = toDisp(o.x, o.y), r = o.r, wob = Math.sin(now / 40) * o.wob * 0.06;
+  o.vis = o.vis == null ? fill / need : o.vis + (fill / need - o.vis) * 0.15;
+  o.wob = Math.max(0, o.wob - 0.03);
+  ctx.save(); ctx.translate(x, y); ctx.scale(1 + wob, 1 - wob);
+  if (paved) { // freshly rolled: a smooth patch the colour of the road, with a shine
+    circle(0, 0, 70); ctx.fillStyle = shade(roadColor(T), -0.06); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 0, 50, 3.7, 4.5); ctx.strokeStyle = "#ffffff66"; ctx.lineWidth = 9; ctx.lineCap = "round"; ctx.stroke(); ctx.restore(); return;
+  }
+  if (glow) { circle(0, 0, r + 26 + Math.sin(now / 160) * 8); ctx.fillStyle = "#fff6b066"; ctx.fill(); }
+  circle(0, 0, r); fillStroke("#5b3d26", 6);
+  circle(0, 4, r * 0.8); ctx.fillStyle = "#3b281a"; ctx.fill();
+  if (o.vis > 0.01) { circle(0, r * 0.12 * (1 - o.vis), r * (0.35 + 0.62 * o.vis)); ctx.fillStyle = o.vis > 0.99 ? "#b07a47" : "#9b6a3f"; ctx.fill(); circle(-r * 0.2, -r * 0.15, r * 0.25 * o.vis); ctx.fillStyle = "#c08a55"; ctx.fill(); }
+  circle(0, 0, r + 12); ctx.setLineDash([16, 14]); ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 7; ctx.stroke(); ctx.setLineDash([]);
+  for (let j = 0; j < need; j++) { // one dot per load the hole needs, along the top of the rim: brown once it has it
+    const a = -Math.PI / 2 + (j - (need - 1) / 2) * 0.62;
+    circle(Math.cos(a) * r * 0.6, Math.sin(a) * r * 0.6, 16);
+    if (j < fill) fillStroke("#c08a55", 4); else { ctx.setLineDash([6, 5]); ctx.lineWidth = 4; ctx.strokeStyle = "#ffffff"; ctx.stroke(); ctx.setLineDash([]); }
+  }
+  ctx.restore();
+  for (const c of o.cones) drawCone(c, now);
+}
+function drawCone(c, now) {
+  const [x, y] = toDisp(c.x, c.y); c.wob = Math.max(0, c.wob - 0.025);
+  ctx.save(); ctx.translate(x, y + 16); ctx.rotate(Math.sin(now / 55) * c.wob * 0.4);
+  rr(-22, -6, 44, 12, 4); fillStroke("#e8642c", 4);
+  ctx.beginPath(); ctx.moveTo(-15, -4); ctx.lineTo(0, -52); ctx.lineTo(15, -4); ctx.closePath(); fillStroke("#ff7a3d", 4);
+  ctx.beginPath(); ctx.moveTo(-10, -18); ctx.lineTo(10, -18); ctx.lineTo(7, -28); ctx.lineTo(-7, -28); ctx.closePath(); ctx.fillStyle = "#fff"; ctx.fill();
+  ctx.restore();
+}
+function drawPile(o, left, max, now, T, glow) {
+  const [x, y] = toDisp(o.x, o.y), k = max ? left / max : 0;
+  o.vis = o.vis == null ? k : o.vis + (k - o.vis) * 0.12;
+  o.wob = Math.max(0, o.wob - 0.03);
+  const r = o.r, sq = Math.sin(now / 40) * o.wob * 0.08, bounce = glow ? Math.abs(Math.sin(now / 220)) * 16 : 0;
+  ctx.save(); ctx.translate(x, y - bounce); ctx.scale(1 + sq, 1 - sq);
+  ctx.beginPath(); ctx.ellipse(0, 10 + bounce, r * 1.05, r * 0.55, 0, 0, Math.PI * 2); ctx.fillStyle = "#00000022"; ctx.fill();
+  if (glow) { circle(0, -10, r + 24 + Math.sin(now / 160) * 8); ctx.fillStyle = "#fff6b066"; ctx.fill(); }
+  if (left <= 0 && o.vis < 0.05) { ctx.beginPath(); ctx.ellipse(0, 0, r * 0.8, r * 0.45, 0, 0, Math.PI * 2); ctx.fillStyle = "#c79a68"; ctx.fill(); ctx.restore(); return; }
+  const sz = 0.55 + 0.45 * clamp(o.vis, 0, 1), w = r * sz, h = r * (0.35 + 0.75 * clamp(o.vis, 0, 1));
+  ctx.beginPath(); ctx.moveTo(-w * 1.05, 6); ctx.bezierCurveTo(-w * 0.9, -h * 1.1, w * 0.9, -h * 1.1, w * 1.05, 6); ctx.quadraticCurveTo(0, 24, -w * 1.05, 6); fillStroke("#a5703f", 6);
+  ctx.beginPath(); ctx.moveTo(-w * 0.6, -h * 0.3); ctx.bezierCurveTo(-w * 0.45, -h * 0.85, w * 0.15, -h * 0.9, w * 0.25, -h * 0.55); ctx.strokeStyle = "#c79059"; ctx.lineWidth = 12; ctx.lineCap = "round"; ctx.stroke();
+  if (T.deco === "snow") { ctx.beginPath(); ctx.moveTo(-w * 0.45, -h * 0.55); ctx.bezierCurveTo(-w * 0.3, -h * 0.92, w * 0.3, -h * 0.92, w * 0.45, -h * 0.55); ctx.quadraticCurveTo(0, -h * 0.4, -w * 0.45, -h * 0.55); ctx.fillStyle = "#fff"; ctx.fill(); }
+  for (const [px, py] of [[-0.5, -0.1], [0.4, -0.2], [0.05, -0.45]]) { circle(px * w, py * h, 7); ctx.fillStyle = "#7d5533"; ctx.fill(); }
+  ctx.restore();
+}
+
+/** Every finger I can see, as display points: mine (all of them) and the other players' leading ones. */
+function fingerPoints() {
+  const out = [];
+  for (const p of pointers.values()) out.push(toDisp(p.x, p.y));
+  for (const v of views.values()) if (v.px != null) out.push(toDisp(v.px, v.py));
+  return out;
+}
+
+const VS = 1.35; // vehicle size
+/** A digger (people) or a dump truck (buddies): a flat chassis turned to its heading, and an upright cab with a face. */
+function drawVehicle(v, now, fingers) {
+  const [x, y] = toDisp(v.x, v.y), A = dispAng(v.a), truck = v.kind === "truck";
+  const color = truck ? BUDDY_COLORS[v.c % BUDDY_COLORS.length] : PALETTE[v.c % PALETTE.length].color;
+  const hop = v.cheer ? Math.abs(Math.sin(now / 130)) * 22 : 0, wob = Math.sin(now / 45) * v.wob * 0.12;
+  const phase = v.act > 0 ? 1 - v.act / ((CONFIG.actMs * (truck ? 1.6 : 1)) / 1000) : 0, swing = Math.sin(phase * Math.PI);
+  if (v.cheer && Math.random() < 0.04) burst({ x: x, y: y - 120 }, 1, "heart", true);
+  ctx.save(); ctx.translate(x, y);
+  ctx.beginPath(); ctx.ellipse(0, 14, 78 * VS * 0.8, 40 * VS * 0.8, 0, 0, Math.PI * 2); ctx.fillStyle = "#00000026"; ctx.fill();
+  ctx.translate(0, -hop); ctx.rotate(wob); ctx.scale(VS, VS);
+  const front = Math.sin(A) > 0; // heading toward the viewer: the arm is drawn in front of the cab
+  ctx.save(); ctx.rotate(A);
+  const wheels = truck ? [[-36, -34], [36, -34], [-36, 34], [36, 34]] : [[-30, -36], [30, -36], [-30, 36], [30, 36]];
+  for (const [wx, wy] of wheels) { rr(wx - 19, wy - 12, 38, 24, 9); fillStroke("#3b3b46", 4); ctx.fillStyle = "#6b6b78"; for (let k = -1; k <= 1; k++) ctx.fillRect(wx + k * 11 - 2 + (((now / 30) * (v.spd || 0) / 200) % 11), wy - 9, 4, 18); }
+  rr(truck ? -58 : -46, -30, truck ? 116 : 92, 60, 16); fillStroke(color, 6);
+  if (truck) drawBed(v, phase);
+  ctx.restore();
+  if (!truck && !front) drawArm(v, A, swing, phase);
+  // the cab: always upright, so the face is always the right way up
+  const cx = truck ? Math.cos(A) * 30 : 0, cy = truck ? Math.sin(A) * 30 - 18 : -18;
+  rr(cx - 30, cy - 50, 60, 52, 14); fillStroke(shade(color, 0.25), 5);
+  rr(cx - 22, cy - 44, 44, 34, 10); fillStroke("#e4f5ff", 4);
+  let lx = Math.cos(A), ly = Math.sin(A), bd = 1e9;
+  for (const [fx, fy] of fingers) { const d = Math.hypot(fx - x, fy - y); if (d < bd && d < 700) { bd = d; lx = (fx - x) / (d || 1); ly = (fy - y) / (d || 1); } }
+  if (truck) drawTruckFace(cx, cy - 27, lx, ly); else drawAnimal(PALETTE[v.c % PALETTE.length].animal, cx, cy - 24, 13, lx, ly);
+  const glow = 0.55 + Math.sin(now / 900) * 0.15; // a beacon that glows softly, never flashes
+  circle(cx, cy - 58, 18); ctx.fillStyle = `rgba(255,214,80,${glow * 0.35})`; ctx.fill();
+  circle(cx, cy - 57, 8); fillStroke("#ffd650", 3);
+  if (!truck && front) drawArm(v, A, swing, phase);
+  if (v.mine) { ctx.beginPath(); ctx.moveTo(cx - 12, cy - 86); ctx.lineTo(cx + 12, cy - 86); ctx.lineTo(cx, cy - 72); ctx.closePath(); fillStroke("#ffffff", 3); } // a little marker: that one is you
+  ctx.restore();
+}
+function drawArm(v, A, swing, phase) {
+  ctx.save(); ctx.rotate(A);
+  const ext = swing * 16, bx = 50 + ext, tilt = v.actKind === "dump" ? swing * 0.9 : -swing * 0.5;
+  ctx.lineCap = "round"; ctx.strokeStyle = OUT; ctx.lineWidth = 16; ctx.beginPath(); ctx.moveTo(14, 0); ctx.lineTo(bx, 0); ctx.stroke();
+  ctx.strokeStyle = "#f2c94c"; ctx.lineWidth = 9; ctx.beginPath(); ctx.moveTo(14, 0); ctx.lineTo(bx, 0); ctx.stroke();
+  ctx.translate(bx, 0); ctx.rotate(tilt);
+  rr(-4, -26, 26, 52, 9); fillStroke("#9aa3ae", 5);
+  for (let k = -2; k <= 2; k++) { ctx.beginPath(); ctx.moveTo(22, k * 10 - 4); ctx.lineTo(30, k * 10); ctx.lineTo(22, k * 10 + 4); ctx.fillStyle = "#7a838e"; ctx.fill(); }
+  const showDirt = v.full ? (v.actKind === "scoop" && phase > 0 && phase < 0.4 ? 0 : 1) : v.actKind === "dump" && phase > 0 && phase < 0.5 ? 1 - phase * 2 : 0;
+  if (showDirt > 0) { ctx.beginPath(); ctx.ellipse(10, 0, 14 * showDirt + 4, 24 * showDirt + 4, 0, 0, Math.PI * 2); fillStroke("#9b6a3f", 4); circle(6, -6, 5); ctx.fillStyle = "#c08a55"; ctx.fill(); }
+  ctx.restore();
+}
+function drawBed(v, phase) {
+  const lift = v.actKind === "dump" && v.act > 0 ? Math.sin(phase * Math.PI) : 0;
+  ctx.save(); ctx.translate(-20, 0); ctx.scale(1 + lift * 0.18, 1 + lift * 0.1);
+  rr(-36, -28, 62, 56, 8); fillStroke(shade(BUDDY_COLORS[v.c % BUDDY_COLORS.length], -0.18), 5);
+  rr(-28, -20, 46, 40, 6); ctx.fillStyle = "#00000030"; ctx.fill();
+  const scoopIn = v.actKind === "scoop" && v.act > 0 ? phase : 1;
+  if (v.full || lift > 0.05) { const k = v.full ? scoopIn : 1 - phase; ctx.beginPath(); ctx.ellipse(-5, 0, 22 * k + 2, 18 * k + 2, 0, 0, Math.PI * 2); fillStroke("#9b6a3f", 4); }
+  ctx.restore();
+}
+function drawTruckFace(x, y, lx, ly) {
+  for (const s of [-1, 1]) { circle(x + s * 10, y, 8); fillStroke("#ffffff", 3); circle(x + s * 10 + lx * 3, y + ly * 3, 4); ctx.fillStyle = "#2b2b33"; ctx.fill(); }
+  ctx.beginPath(); ctx.arc(x, y + 7, 9, 0.2, Math.PI - 0.2); ctx.lineWidth = 3; ctx.strokeStyle = OUT; ctx.stroke();
+}
+const FUR = { fox: "#f08a3c", bunny: "#f4efe9", frog: "#7fd36b", cat: "#b9b2c9", pig: "#f7b6c8", bear: "#b98552" };
+/** A big friendly animal face (the player's driver); its eyes look toward (lx, ly). */
+function drawAnimal(kind, x, y, R, lx, ly) {
+  const fur = FUR[kind] || "#ddd";
+  ctx.lineWidth = 3; ctx.strokeStyle = OUT; ctx.fillStyle = fur;
+  const tri = (s, a, b, c) => { ctx.beginPath(); ctx.moveTo(x + s * a[0] * R, y + a[1] * R); ctx.lineTo(x + s * b[0] * R, y + b[1] * R); ctx.lineTo(x + s * c[0] * R, y + c[1] * R); ctx.closePath(); ctx.fill(); ctx.stroke(); };
+  for (const s of [-1, 1]) {
+    if (kind === "fox") tri(s, [0.85, -0.3], [0.95, -1.35], [0.2, -0.85]);
+    else if (kind === "cat") tri(s, [0.85, -0.2], [0.8, -1.15], [0.25, -0.8]);
+    else if (kind === "pig") tri(s, [0.8, -0.5], [0.95, -1.05], [0.35, -0.85]);
+    else if (kind === "bunny") { ctx.beginPath(); ctx.ellipse(x + s * 0.42 * R, y - 1.25 * R, 0.28 * R, 0.75 * R, s * 0.15, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+    else if (kind === "bear") { circle(x + s * 0.75 * R, y - 0.75 * R, 0.38 * R); ctx.fill(); ctx.stroke(); }
+    else if (kind === "frog") { circle(x + s * 0.5 * R, y - 0.75 * R, 0.45 * R); ctx.fill(); ctx.stroke(); }
+    ctx.fillStyle = fur;
+  }
+  circle(x, y, R); ctx.fill(); ctx.stroke();
+  if (kind === "fox") { ctx.beginPath(); ctx.ellipse(x, y + 0.4 * R, 0.7 * R, 0.45 * R, 0, 0, Math.PI * 2); ctx.fillStyle = "#fff4ea"; ctx.fill(); }
+  if (kind === "bear") { ctx.beginPath(); ctx.ellipse(x, y + 0.35 * R, 0.45 * R, 0.32 * R, 0, 0, Math.PI * 2); ctx.fillStyle = "#e2bf94"; ctx.fill(); }
+  const ey = kind === "frog" ? -0.75 : -0.15;
+  for (const s of [-1, 1]) {
+    const ex = x + s * (kind === "frog" ? 0.5 : 0.38) * R, eyy = y + ey * R;
+    if (kind === "frog") { circle(ex, eyy, 0.28 * R); ctx.fillStyle = "#fff"; ctx.fill(); }
+    circle(ex + lx * 0.08 * R, eyy + ly * 0.08 * R, 0.17 * R); ctx.fillStyle = "#2b2b33"; ctx.fill();
+    circle(ex + lx * 0.08 * R - 0.05 * R, eyy + ly * 0.08 * R - 0.06 * R, 0.06 * R); ctx.fillStyle = "#fff"; ctx.fill();
+    circle(x + s * 0.62 * R, y + 0.3 * R, 0.15 * R); ctx.fillStyle = "#ff9aa866"; ctx.fill();
+  }
+  if (kind === "pig") { ctx.beginPath(); ctx.ellipse(x, y + 0.3 * R, 0.32 * R, 0.22 * R, 0, 0, Math.PI * 2); ctx.fillStyle = "#f59ab3"; ctx.fill(); ctx.stroke(); for (const s of [-1, 1]) { circle(x + s * 0.11 * R, y + 0.3 * R, 0.05 * R); ctx.fillStyle = OUT; ctx.fill(); } }
+  else { circle(x, y + 0.18 * R, 0.1 * R); ctx.fillStyle = kind === "bunny" || kind === "cat" ? "#f58fa6" : "#2b2b33"; ctx.fill(); }
+  ctx.beginPath(); ctx.arc(x, y + 0.3 * R, 0.3 * R, 0.3, Math.PI - 0.3); ctx.lineWidth = 2.5; ctx.strokeStyle = OUT; ctx.stroke();
+}
+
+/** Another player's finger: a soft ring in their colour with their animal on it. */
+function drawFinger(px, py, c, now) {
+  const [x, y] = toDisp(px, py), pal = PALETTE[c % PALETTE.length], pulse = 1 + Math.sin(now / 200) * 0.08;
+  circle(x, y, 40 * pulse); ctx.fillStyle = pal.color + "55"; ctx.fill(); ctx.lineWidth = 5; ctx.strokeStyle = pal.color; ctx.stroke();
+  drawAnimal(pal.animal, x, y + 2, 16, 0, 1);
+}
+
+/** A big bouncing arrow over where my bucket should go next. */
+function drawArrow(now) {
+  if (ATTRACT || !lk || lk.s.cel || !me.placed || now - seenSite.slideAt < CONFIG.slideMs) return;
+  const t = nextTarget(); if (!t) return;
+  const [x, y] = toDisp(t.o.x, t.o.y), bob = Math.abs(Math.sin(now / 260)) * 22, s = (me.help ? 1.3 : 1) * (1 + Math.sin(now / 200) * 0.06), col = PALETTE[me.c].color;
+  const below = y - t.o.r - 130 < 0; // no room above (top edge): point up from below instead
+  ctx.save(); ctx.translate(x, below ? y + t.o.r + 70 + bob : y - t.o.r - 70 - bob); ctx.scale(s, below ? -s : s);
+  ctx.beginPath(); ctx.moveTo(-18, -50); ctx.lineTo(18, -50); ctx.lineTo(18, -12); ctx.lineTo(38, -12); ctx.lineTo(0, 26); ctx.lineTo(-38, -12); ctx.lineTo(-18, -12); ctx.closePath();
+  ctx.lineJoin = "round"; ctx.fillStyle = col; ctx.fill(); ctx.lineWidth = 7; ctx.strokeStyle = "#ffffff"; ctx.stroke();
+  ctx.restore();
+}
+
+/** The drawn hand: in the first seconds, and after a while without a touch, it taps the next target. */
+function drawHint(now) {
+  if (ATTRACT || !lk || lk.s.cel || !me.placed || now - seenSite.slideAt < CONFIG.slideMs) return;
+  const idle = now - Math.max(lastInputAt, me.actedAt);
+  if (anyInput ? idle < CONFIG.hintIdleMs : now - startedAt < 900) return;
+  const t = nextTarget(); if (!t) return;
+  const cyc = (now % 2400) / 2400, [mx, my] = toDisp(me.x, me.y), [tx, ty] = toDisp(t.o.x, t.o.y);
+  const k = clamp(cyc / 0.4, 0, 1), e = k * k * (3 - 2 * k), x = mx + (tx - mx) * e, y = my + (ty - my) * e, press = cyc > 0.45 && cyc < 0.65;
+  const fade = cyc < 0.08 ? cyc / 0.08 : cyc > 0.85 ? (1 - cyc) / 0.15 : 1;
+  if (press) { circle(tx, ty, 30 + (cyc - 0.45) * 300); ctx.lineWidth = 6; ctx.strokeStyle = `rgba(255,255,255,${0.8 - (cyc - 0.45) * 4})`; ctx.stroke(); }
+  ctx.save(); ctx.globalAlpha = clamp(fade, 0, 1); ctx.translate(x + 18, y + 22); ctx.scale(press ? 0.9 : 1, press ? 0.9 : 1);
+  rr(-12, -46, 24, 52, 12); fillStroke("#ffe0c2", 5);     // the pointing finger
+  rr(-30, -8, 60, 52, 20); fillStroke("#ffe0c2", 5);      // the hand
+  ctx.restore();
+}
+
+function drawParts() {
+  for (const p of parts) {
+    const a = clamp(p.life / p.max, 0, 1) * (p.kind === "confetti" ? clamp((p.max - p.life) * 4, 0, 1) : 1); // bursts fade in and out
+    ctx.globalAlpha = Math.min(1, a * 1.6);
+    if (p.kind === "confetti") { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillStyle = p.col; ctx.fillRect(-p.r / 2, -p.r / 4, p.r, p.r / 2); ctx.restore(); }
+    else if (p.kind === "heart") { const r = p.r; ctx.beginPath(); ctx.moveTo(p.x, p.y + r * 0.8); ctx.bezierCurveTo(p.x - r * 1.4, p.y - r * 0.2, p.x - r * 0.5, p.y - r * 1.2, p.x, p.y - r * 0.4); ctx.bezierCurveTo(p.x + r * 0.5, p.y - r * 1.2, p.x + r * 1.4, p.y - r * 0.2, p.x, p.y + r * 0.8); ctx.fillStyle = p.col; ctx.fill(); }
+    else if (p.kind === "note") { circle(p.x, p.y, p.r * 0.6); ctx.fillStyle = p.col; ctx.fill(); ctx.fillRect(p.x + p.r * 0.45, p.y - p.r * 1.6, 4, p.r * 1.6); }
+    else if (p.kind === "ring") { circle(p.x, p.y, p.r); ctx.lineWidth = 6; ctx.strokeStyle = p.col; ctx.stroke(); }
+    else if (p.kind === "spark") { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillStyle = p.col; ctx.beginPath(); for (let k = 0; k < 8; k++) { const rr2 = k % 2 ? p.r * 0.4 : p.r; ctx.lineTo(Math.cos((k / 8) * Math.PI * 2) * rr2, Math.sin((k / 8) * Math.PI * 2) * rr2); } ctx.closePath(); ctx.fill(); ctx.restore(); }
+    else { circle(p.x, p.y, p.r * 0.8); ctx.fillStyle = p.col; ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ── THE PARTY ───────────────────────────────────────────────────────────────────────
+// Every hole full: the steamroller rolls the new road flat, then a parade drives along it.
+const seenSite = { id: null, last: null, prev: null, slideAt: -1e9, celStart: 0, sawDigging: false };
+const party = { honked: new Set(), tuned: false, nextRumble: 0 };
+const partyAge = (now) => (lk && lk.s.cel && seenSite.celStart ? now - seenSite.celStart : -1);
+const rollerT = (age) => -0.12 + 1.24 * clamp(age / CONFIG.rollMs, 0, 1.2);
+
+/** A new site id → reset my digger's job and slide the new site in. The party starting → cheer. */
+function syncSite(now) {
+  const s = truthSite();
+  if (!s) return;
+  if (s.id !== seenSite.id) {
+    if (seenSite.id !== null && seenSite.last) { seenSite.prev = { s: seenSite.last, Lo: layoutOf(seenSite.last) }; seenSite.slideAt = now; }
+    Object.assign(seenSite, { id: s.id, celStart: 0, sawDigging: !s.cel });
+    Object.assign(me, { full: false, pend: [], goal: null, wrong: 0, help: false });
+    party.honked.clear(); party.tuned = false;
+  }
+  if (s.cel && !seenSite.celStart) { // the party started (or was already on when I arrived)
+    seenSite.celStart = isHost() && world.celAt ? world.celAt : seenSite.sawDigging ? now : now - clamp(Date.now() - s.cel, 0, partyMs());
+    if (now - seenSite.celStart < 500) { confetti(40); sfx.full(); say("Hooray!"); }
+  }
+  if (!s.cel) seenSite.sawDigging = true;
+  seenSite.last = s;
+  me.pend = me.pend.filter((q) => q.site === s.id && q.n > ((s.ak && s.ak[net.sessionId]) || 0) && now - q.at < 3000);
+}
+
+function partyTick(now, dt) {
+  const age = partyAge(now);
+  if (age < 0) return;
+  if (age < CONFIG.rollMs && now > party.nextRumble) { party.nextRumble = now + 230; sfx.rumble(); }
+  if (age > CONFIG.rollMs) {
+    if (!party.tuned) { party.tuned = true; sfx.tune(); confetti(30); }
+    if (age < partyMs() && Math.random() < dt * 30) confetti(1);
+  }
+}
+
+function drawParty(now, look) {
+  const age = partyAge(now);
+  if (age < 0) return;
+  const road = look.Lo.road;
+  if (age < CONFIG.rollMs + 400) { const p = alongRoad(road, rollerT(age)); drawRoller(p, now); }
+  if (age > CONFIG.rollMs) {
+    const pe = (age - CONFIG.rollMs) / CONFIG.paradeMs, list = look.Lo.T.parade;
+    list.forEach((kind, k) => {
+      const t = -0.1 + 1.45 * pe - k * 0.17;
+      if (t < -0.15 || t > 1.15) return;
+      const p = alongRoad(road, t), [x, y] = toDisp(p.x, p.y), [dx] = toDisp(Math.cos(p.a), Math.sin(p.a));
+      if (t > 0.45 && !party.honked.has(k)) { party.honked.add(k); sfx.honk(k); }
+      if (kind === "ducks") drawDucks(look.Lo, now, t);
+      else drawParadeCar(kind, x, y + 30, dx >= 0 ? 1 : -1, now);
+    });
+  }
+}
+function drawRoller(p, now) {
+  const [x, y] = toDisp(p.x, p.y), [dx] = toDisp(Math.cos(p.a), Math.sin(p.a)), dir = dx >= 0 ? 1 : -1;
+  ctx.save(); ctx.translate(x, y + 30); ctx.scale(dir * 1.2, 1.2);
+  ctx.beginPath(); ctx.ellipse(0, 4, 110, 20, 0, 0, Math.PI * 2); ctx.fillStyle = "#00000026"; ctx.fill();
+  rr(-80, -70, 100, 52, 14); fillStroke("#f2b23a", 6);
+  rr(-66, -128, 60, 62, 12); fillStroke("#f7c85a", 5); rr(-58, -120, 44, 34, 8); fillStroke("#e4f5ff", 4);
+  drawTruckFace(-36, -104, 1, 0);
+  circle(-50, -10, 26); fillStroke("#3b3b46", 5);
+  circle(52, -32, 38); fillStroke("#8d96a3", 6); // the big drum
+  ctx.save(); ctx.translate(52, -32); ctx.rotate(now / 120); ctx.strokeStyle = "#6b737e"; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(-30, 0); ctx.lineTo(30, 0); ctx.moveTo(0, -30); ctx.lineTo(0, 30); ctx.stroke(); ctx.restore();
+  ctx.restore();
+}
+/** A parade vehicle seen from the side: bus, ice-cream van or fire engine, with waving passengers. */
+function drawParadeCar(kind, x, y, dir, now) {
+  const body = { bus: "#f7c843", icecream: "#ffd1e3", fire: "#ef5d5d" }[kind];
+  ctx.save(); ctx.translate(x, y); ctx.scale(dir, 1);
+  ctx.beginPath(); ctx.ellipse(0, 4, 130, 20, 0, 0, Math.PI * 2); ctx.fillStyle = "#00000026"; ctx.fill();
+  if (kind === "icecream") { ctx.beginPath(); ctx.moveTo(-30, -112); ctx.lineTo(0, -60); ctx.lineTo(30, -112); ctx.closePath(); fillStroke("#e8b26a", 5); circle(0, -122, 28); fillStroke("#ff9ac1", 5); circle(-10, -132, 8); ctx.fillStyle = "#fff"; ctx.fill(); }
+  if (kind === "fire") { rr(-90, -116, 150, 14, 6); fillStroke("#d9dde3", 4); for (let k = 0; k < 6; k++) { ctx.fillStyle = OUT; ctx.fillRect(-82 + k * 24, -116, 4, 14); } circle(70, -112, 12); fillStroke("#ffd650", 3); }
+  rr(-120, -100, 240, 86, 22); fillStroke(body, 6);
+  if (kind === "icecream") { ctx.fillStyle = "#ff9ac1"; ctx.fillRect(-114, -44, 228, 12); }
+  for (let k = 0; k < 4; k++) { // windows with passengers waving
+    const wx = -100 + k * 52; rr(wx, -88, 40, 38, 9); fillStroke("#e4f5ff", 4);
+    const col = CONFETTI[(k + kind.length) % CONFETTI.length], wave = Math.sin(now / 140 + k * 1.3);
+    circle(wx + 20, -64, 11); fillStroke(col, 3);
+    ctx.lineCap = "round"; ctx.strokeStyle = OUT; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(wx + 30, -60); ctx.lineTo(wx + 38 + wave * 4, -84 - Math.abs(wave) * 6); ctx.stroke();
+  }
+  rr(98, -88, 18, 30, 6); fillStroke("#e4f5ff", 3);
+  for (const wx of [-72, 72]) { circle(wx, -12, 24); fillStroke("#3b3b46", 5); circle(wx, -12, 9); ctx.fillStyle = "#b9bfc8"; ctx.fill(); }
+  ctx.restore();
+}
+/** Ducks: waiting by the pond while the bank is dug, then waddling across in the parade (t ≥ 0). */
+function drawDucks(Lo, now, t) {
+  for (let k = 0; k < 4; k++) {
+    const p = t < 0 ? { ...alongRoad(Lo.road, 0.02), y: alongRoad(Lo.road, 0.02).y + 130 + k * 36 } : alongRoad(Lo.road, t - k * 0.04);
+    const [x, y] = toDisp(p.x - (t < 0 ? 0 : 0), p.y), s = k ? 0.65 : 1, rock = Math.sin(now / 110 + k) * (t < 0 ? 0.05 : 0.2);
+    ctx.save(); ctx.translate(x + (t < 0 ? k * 20 : 0), y + 20); ctx.rotate(rock); ctx.scale(s * 1.3, s * 1.3);
+    ctx.beginPath(); ctx.ellipse(0, -18, 26, 18, 0, 0, Math.PI * 2); fillStroke("#ffd84a", 4);
+    circle(16, -40, 13); fillStroke("#ffd84a", 4);
+    ctx.beginPath(); ctx.moveTo(27, -42); ctx.lineTo(40, -38); ctx.lineTo(27, -34); ctx.closePath(); fillStroke("#f6a13a", 3);
+    circle(19, -44, 3); ctx.fillStyle = OUT; ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── HUD ─────────────────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+let dropped = false; // true while the connection is down: the HUD keeps showing "Reconnecting…"
+function hud() {
+  if (ATTRACT) { $("net").textContent = ""; return; }
+  const n = livePlayers().length;
+  $("net").textContent = net.offline ? "Offline: playing with bots" : dropped ? "Reconnecting…" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the buddies" : ""}`;
+}
+
+// ── INPUT ───────────────────────────────────────────────────────────────────────────
+// Every finger is tracked by its pointerId. The newest finger leads the digger; the others
+// still sparkle. A touch on your own digger honks. Touching a pile or a hole sends you there.
+const pointers = new Map(); // pointerId -> { x, y (site), sx, sy (screen), downAt, mode: "lead" | "honk", lastSpark }
+const keys = new Set();
+let leadId = null, lastInputAt = -1e9, anyInput = false, startedAt = 0;
+
+/** The pile or hole under a site point (taps count up to 1.4× its size), or null. */
+function objectAt(x, y) {
+  if (!lk) return null;
+  let best = null, bd = 1e9;
+  lk.Lo.piles.forEach((o, i) => { const d = dist(x, y, o.x, o.y); if (lk.p[i] > 0 && d < o.r * 1.4 && d < bd) { bd = d; best = { k: "pile", i }; } });
+  lk.Lo.holes.forEach((o, i) => { const d = dist(x, y, o.x, o.y); if (d < o.r * 1.4 && d < bd) { bd = d; best = { k: "hole", i }; } });
+  return best;
+}
+function steerTo(x, y) {
+  const hit = objectAt(x, y);
+  if (hit) { if (!me.goal || me.goal.k !== hit.k || me.goal.i !== hit.i) me.goal = { ...hit, done: false }; const o = objOf(hit); me.tx = o.x; me.ty = o.y; }
+  else { me.goal = null; me.tx = clamp(x, EDGE, SW - EDGE); me.ty = clamp(y, EDGE, SH - EDGE); }
+}
+function honk() {
+  const now = performance.now();
+  if (now - me.honkAt < 250) return;
+  me.honkAt = now; me.wob = 1; sfx.horn(me.c);
+  const [x, y] = toDisp(me.x, me.y); burst({ x, y: y - 100 }, 3, "note", true);
+  net.send("honk", {});
+}
+function touched() { lastInputAt = performance.now(); anyInput = true; me.inputs++; if (isHost()) world.humanAt = lastInputAt; }
+
+cv.addEventListener("pointerdown", (e) => {
+  e.preventDefault(); audioOn(); touched();
+  try { cv.setPointerCapture(e.pointerId); } catch {}
+  const [x, y] = screenToSite(e.clientX, e.clientY), p = { x, y, sx: e.clientX, sy: e.clientY, downAt: performance.now(), mode: "lead", lastSpark: 0 };
+  burst({ x: (e.clientX - VIEW.ox) / VIEW.s, y: (e.clientY - VIEW.oy) / VIEW.s }, 5, "spark", true); sfx.tick(); // every touch answers
+  if (me.placed && dist(x, y, me.x, me.y) < 100) { p.mode = "honk"; honk(); }
+  else { leadId = e.pointerId; steerTo(x, y); }
+  pointers.set(e.pointerId, p);
+});
+cv.addEventListener("pointermove", (e) => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  [p.x, p.y] = screenToSite(e.clientX, e.clientY);
+  if (p.mode === "honk" && Math.hypot(e.clientX - p.sx, e.clientY - p.sy) > 40) { p.mode = "lead"; p.downAt = performance.now(); leadId = e.pointerId; }
+  if (e.pointerId === leadId) { steerTo(p.x, p.y); lastInputAt = performance.now(); }
+  else if (performance.now() - p.lastSpark > 90) { p.lastSpark = performance.now(); burst({ x: (e.clientX - VIEW.ox) / VIEW.s, y: (e.clientY - VIEW.oy) / VIEW.s }, 2, "spark", true); }
+});
+function release(e) {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.delete(e.pointerId);
+  if (leadId !== e.pointerId) return;
+  leadId = null; // the newest finger still down takes over; the digger carries on to where this one let go
+  let newest = null;
+  for (const [id, p] of pointers) if (p.mode === "lead" && (!newest || p.downAt > newest.downAt)) newest = { id, ...p };
+  if (newest) { leadId = newest.id; steerTo(newest.x, newest.y); }
+}
+for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) cv.addEventListener(ev, release);
+addEventListener("pointerup", release);
+addEventListener("keydown", (e) => { if (e.code.startsWith("Arrow")) { e.preventDefault(); keys.add(e.code); touched(); audioOn(); } });
+addEventListener("keyup", (e) => keys.delete(e.code));
+addEventListener("blur", () => { keys.clear(); pointers.clear(); leadId = null; }); // nothing stays "held" after the tab loses focus
+document.addEventListener("contextmenu", (e) => e.preventDefault());
+document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+document.addEventListener("gesturestart", (e) => e.preventDefault());
+
+// ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
+let last = performance.now(), lastHb = 0, lastHud = 0, nextPutt = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const t0 = performance.now(); // not `now`: the first frame after a freeze can be stamped from before it ended
+  if (frameAt && t0 - frameAt > 1000) { wokeAt = t0; world.wasHost = false; } // woke from a stall: drop my host copy, adopt state again (see isHost)
+  frameAt = t0;
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now; // the first frame can be stamped before `last`
+  if (t0 - lastHb > 1000) { lastHb = t0; net.me.set("hb", Date.now()); fixColor(); }
+  if (isHost()) hostTick(dt, t0); else world.wasHost = false;
+  syncSite(t0);
+  lk = look();
+  myTick(dt, t0);
+  lk = look();
+  syncViews(t0, dt);
+  publish(false);
+  watchEffects(t0);
+  bumps();
+  partyTick(t0, dt);
+  if (!ATTRACT && me.spd > 40 && t0 > nextPutt) { nextPutt = t0 + 170 - Math.min(70, me.spd / 5); sfx.putt(); } // a soft putt-putt while I drive
+  stepParts(dt);
+  draw(t0, dt);
+  if (t0 - lastHud > 250) { lastHud = t0; hud(); }
+}
+/** For tests and tuning: the site in one line. */
+function game() { const s = truthSite(); return s && { id: s.id, h: s.h.join(""), nd: s.nd.join(""), p: s.p.join(","), cel: s.cel ? 1 : 0, bots: [...world.bots.values()].map((b) => b.st + (b.full ? "F" : "")).join(" ") }; }
+
+(async function start() {
+  net = await connect();
+  net.onState((st) => { S = st; });
+  net.on("scoop", (m, from) => { if (isHost()) hostIntent("scoop", from, m); });
+  net.on("dump", (m, from) => { if (isHost()) hostIntent("dump", from, m); });
+  net.on("nope", (m) => onNope(m));
+  net.on("honk", (m, from) => { const v = views.get(from); if (!v) return; v.wob = 1; sfx.horn(v.c, true); const [x, y] = toDisp(v.x, v.y); burst({ x, y: y - 100 }, 3, "note", true); });
+  net.onDisconnect(() => { dropped = true; $("net").textContent = "Reconnecting…"; });
+  net.onReconnect(() => { dropped = false; });
+  const taken = new Set(Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => Number(p.c)));
+  me.c = Math.max(0, PALETTE.findIndex((_, k) => !taken.has(k)));
+  net.me.set({ c: me.c, hb: Date.now() });
+  startedAt = performance.now();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
